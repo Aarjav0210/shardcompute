@@ -20,13 +20,35 @@ class ModelConfig:
     rms_norm_eps: float = 1e-5
     rope_theta: float = 10000.0
     tie_word_embeddings: bool = False
-    
+
+    # MLP configuration
+    hidden_act: str = "silu"  # Activation function: silu, gelu, gelu_new
+    use_gated_mlp: bool = True  # LLaMA uses gated (SwiGLU), Phi-2 does not
+
     # Architecture identifiers
     model_type: str = "llama"
+
+    # Quantization (will be set after parsing config)
+    quantization: Optional["QuantizationConfig"] = None
     
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "ModelConfig":
         """Create config from dictionary."""
+        model_type = data.get("model_type", "llama")
+
+        # Auto-detect MLP style based on model type
+        # Phi-2 uses non-gated MLP with gelu_new, LLaMA uses gated with silu
+        if model_type == "phi":
+            default_hidden_act = "gelu_new"
+            default_use_gated = False
+        else:
+            default_hidden_act = "silu"
+            default_use_gated = True
+
+        # Parse quantization config if present
+        quant_data = data.get("quantization")
+        quantization = QuantizationConfig.from_dict(quant_data) if quant_data else None
+
         return cls(
             vocab_size=data.get("vocab_size", 32000),
             hidden_size=data.get("hidden_size", 2048),
@@ -38,7 +60,10 @@ class ModelConfig:
             rms_norm_eps=data.get("rms_norm_eps", 1e-5),
             rope_theta=data.get("rope_theta", 10000.0),
             tie_word_embeddings=data.get("tie_word_embeddings", False),
-            model_type=data.get("model_type", "llama"),
+            hidden_act=data.get("hidden_act", default_hidden_act),
+            use_gated_mlp=data.get("use_gated_mlp", default_use_gated),
+            model_type=model_type,
+            quantization=quantization,
         )
     
     @classmethod
@@ -56,7 +81,7 @@ class ModelConfig:
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
-        return {
+        result = {
             "vocab_size": self.vocab_size,
             "hidden_size": self.hidden_size,
             "num_hidden_layers": self.num_layers,
@@ -67,8 +92,13 @@ class ModelConfig:
             "rms_norm_eps": self.rms_norm_eps,
             "rope_theta": self.rope_theta,
             "tie_word_embeddings": self.tie_word_embeddings,
+            "hidden_act": self.hidden_act,
+            "use_gated_mlp": self.use_gated_mlp,
             "model_type": self.model_type,
         }
+        if self.quantization:
+            result["quantization"] = self.quantization.to_dict()
+        return result
     
     @property
     def head_dim(self) -> int:
@@ -176,3 +206,46 @@ class ShardingConfig:
     def get_kv_shard_size(self) -> int:
         """Size of K, V projection shard (for GQA)."""
         return self.local_num_kv_heads * self.local_head_dim
+
+
+@dataclass
+class QuantizationConfig:
+    """Configuration for model quantization."""
+
+    enabled: bool = False
+    bits: int = 4  # 4-bit or 8-bit quantization
+    group_size: int = 64  # Quantization group size
+
+    # Which layers to quantize
+    quantize_attention: bool = True
+    quantize_mlp: bool = True
+    quantize_embeddings: bool = False  # Usually not quantized
+    quantize_lm_head: bool = False  # Usually not quantized
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "QuantizationConfig":
+        """Create config from dictionary."""
+        if not data:
+            return cls(enabled=False)
+
+        return cls(
+            enabled=True,  # If quantization dict exists, it's enabled
+            bits=data.get("bits", 4),
+            group_size=data.get("group_size", 64),
+            quantize_attention=data.get("quantize_attention", True),
+            quantize_mlp=data.get("quantize_mlp", True),
+            quantize_embeddings=data.get("quantize_embeddings", False),
+            quantize_lm_head=data.get("quantize_lm_head", False),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary."""
+        return {
+            "enabled": self.enabled,
+            "bits": self.bits,
+            "group_size": self.group_size,
+            "quantize_attention": self.quantize_attention,
+            "quantize_mlp": self.quantize_mlp,
+            "quantize_embeddings": self.quantize_embeddings,
+            "quantize_lm_head": self.quantize_lm_head,
+        }

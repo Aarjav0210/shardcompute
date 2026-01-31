@@ -8,6 +8,10 @@ import logging
 from shardcompute.collectives.communicator import Communicator
 from shardcompute.parallel.column_linear import ColumnParallelLinear
 from shardcompute.parallel.row_linear import RowParallelLinear
+from shardcompute.parallel.quantized_linear import (
+    QuantizedColumnParallelLinear,
+    QuantizedRowParallelLinear,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -182,10 +186,13 @@ class ParallelAttention:
         max_position_embeddings: int = 2048,
         rope_base: float = 10000.0,
         rope_scaling_factor: float = 1.0,
+        use_quantized: bool = False,
+        quantization_bits: int = 4,
+        quantization_group_size: int = 64,
     ):
         """
         Initialize ParallelAttention.
-        
+
         Args:
             hidden_size: Model hidden dimension
             num_heads: Total number of attention heads
@@ -199,6 +206,9 @@ class ParallelAttention:
             max_position_embeddings: Maximum sequence length for RoPE
             rope_base: Base frequency for RoPE
             rope_scaling_factor: Scaling factor for extended context
+            use_quantized: Whether to use quantized linear layers
+            quantization_bits: Bit width for quantization (4 or 8)
+            quantization_group_size: Group size for quantization
         """
         self.hidden_size = hidden_size
         self.num_heads = num_heads
@@ -235,49 +245,87 @@ class ParallelAttention:
             base=rope_base,
             scaling_factor=rope_scaling_factor,
         )
-        
-        # Q projection: column parallel
-        # Full: [hidden_size, num_heads * head_dim]
-        # Local: [hidden_size, local_num_heads * head_dim]
-        self.q_proj = ColumnParallelLinear(
-            in_features=hidden_size,
-            out_features=num_heads * self.head_dim,
-            world_size=world_size,
-            rank=rank,
-            bias=bias,
-            gather_output=False,
-        )
-        
-        # K projection: column parallel (may be smaller for GQA)
-        self.k_proj = ColumnParallelLinear(
-            in_features=hidden_size,
-            out_features=self.num_kv_heads * self.head_dim,
-            world_size=world_size,
-            rank=rank,
-            bias=bias,
-            gather_output=False,
-        )
-        
-        # V projection: column parallel
-        self.v_proj = ColumnParallelLinear(
-            in_features=hidden_size,
-            out_features=self.num_kv_heads * self.head_dim,
-            world_size=world_size,
-            rank=rank,
-            bias=bias,
-            gather_output=False,
-        )
-        
-        # Output projection: row parallel (all-reduce at end)
-        self.o_proj = RowParallelLinear(
-            in_features=num_heads * self.head_dim,
-            out_features=hidden_size,
-            world_size=world_size,
-            rank=rank,
-            bias=bias,
-            input_is_partitioned=True,
-            communicator=communicator,
-        )
+
+        self.use_quantized = use_quantized
+
+        if use_quantized:
+            # Quantized projections
+            self.q_proj = QuantizedColumnParallelLinear(
+                in_features=hidden_size,
+                out_features=num_heads * self.head_dim,
+                world_size=world_size,
+                rank=rank,
+                bias=bias,
+                gather_output=False,
+                bits=quantization_bits,
+                group_size=quantization_group_size,
+            )
+            self.k_proj = QuantizedColumnParallelLinear(
+                in_features=hidden_size,
+                out_features=self.num_kv_heads * self.head_dim,
+                world_size=world_size,
+                rank=rank,
+                bias=bias,
+                gather_output=False,
+                bits=quantization_bits,
+                group_size=quantization_group_size,
+            )
+            self.v_proj = QuantizedColumnParallelLinear(
+                in_features=hidden_size,
+                out_features=self.num_kv_heads * self.head_dim,
+                world_size=world_size,
+                rank=rank,
+                bias=bias,
+                gather_output=False,
+                bits=quantization_bits,
+                group_size=quantization_group_size,
+            )
+            self.o_proj = QuantizedRowParallelLinear(
+                in_features=num_heads * self.head_dim,
+                out_features=hidden_size,
+                world_size=world_size,
+                rank=rank,
+                bias=bias,
+                input_is_partitioned=True,
+                communicator=communicator,
+                bits=quantization_bits,
+                group_size=quantization_group_size,
+            )
+        else:
+            # Standard (non-quantized) projections
+            self.q_proj = ColumnParallelLinear(
+                in_features=hidden_size,
+                out_features=num_heads * self.head_dim,
+                world_size=world_size,
+                rank=rank,
+                bias=bias,
+                gather_output=False,
+            )
+            self.k_proj = ColumnParallelLinear(
+                in_features=hidden_size,
+                out_features=self.num_kv_heads * self.head_dim,
+                world_size=world_size,
+                rank=rank,
+                bias=bias,
+                gather_output=False,
+            )
+            self.v_proj = ColumnParallelLinear(
+                in_features=hidden_size,
+                out_features=self.num_kv_heads * self.head_dim,
+                world_size=world_size,
+                rank=rank,
+                bias=bias,
+                gather_output=False,
+            )
+            self.o_proj = RowParallelLinear(
+                in_features=num_heads * self.head_dim,
+                out_features=hidden_size,
+                world_size=world_size,
+                rank=rank,
+                bias=bias,
+                input_is_partitioned=True,
+                communicator=communicator,
+            )
         
         logger.debug(
             f"ParallelAttention rank {rank}: "
@@ -301,6 +349,34 @@ class ParallelAttention:
         self.k_proj.load_shard_direct(k_weight, k_bias)
         self.v_proj.load_shard_direct(v_weight, v_bias)
         self.o_proj.load_shard_direct(o_weight, o_bias)
+
+    def load_quantized_shards(
+        self,
+        q_weight: mx.array,
+        q_scales: mx.array,
+        q_biases: mx.array,
+        q_linear_bias: Optional[mx.array],
+        k_weight: mx.array,
+        k_scales: mx.array,
+        k_biases: mx.array,
+        k_linear_bias: Optional[mx.array],
+        v_weight: mx.array,
+        v_scales: mx.array,
+        v_biases: mx.array,
+        v_linear_bias: Optional[mx.array],
+        o_weight: mx.array,
+        o_scales: mx.array,
+        o_biases: mx.array,
+        o_linear_bias: Optional[mx.array],
+    ):
+        """Load pre-quantized sharded weights for all projections."""
+        if not self.use_quantized:
+            raise RuntimeError("Cannot load quantized shards into non-quantized attention")
+
+        self.q_proj.load_quantized_shard(q_weight, q_scales, q_biases, q_linear_bias)
+        self.k_proj.load_quantized_shard(k_weight, k_scales, k_biases, k_linear_bias)
+        self.v_proj.load_quantized_shard(v_weight, v_scales, v_biases, v_linear_bias)
+        self.o_proj.load_quantized_shard(o_weight, o_scales, o_biases, o_linear_bias)
     
     async def forward(
         self,

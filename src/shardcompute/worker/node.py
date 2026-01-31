@@ -235,6 +235,21 @@ class WorkerNode:
                 rope_theta=model_config.get("rope_theta", 10000.0),
             )
         
+        # Check for quantized weights before creating model
+        is_quantized = False
+        quantization_bits = 4
+        quantization_group_size = 64
+
+        if self.shard_dir and self.shard_dir.exists():
+            is_quantized = ModelLoader.detect_quantization(self.shard_dir, self.rank)
+            if is_quantized:
+                logger.info(f"Rank {self.rank}: Quantized weights detected, enabling quantized inference")
+                # Get quantization parameters from config if available
+                if config.quantization:
+                    quantization_bits = config.quantization.bits
+                    quantization_group_size = config.quantization.group_size
+                    logger.info(f"Rank {self.rank}: Using {quantization_bits}-bit quantization with group size {quantization_group_size}")
+
         # Create parallel model
         self.model = ParallelTransformer(
             vocab_size=config.vocab_size,
@@ -249,11 +264,18 @@ class WorkerNode:
             max_position_embeddings=config.max_position_embeddings,
             rms_norm_eps=config.rms_norm_eps,
             rope_base=config.rope_theta,  # RoPE base frequency
+            mlp_activation=config.hidden_act,  # MLP activation function
+            use_gated_mlp=config.use_gated_mlp,  # Gated MLP (LLaMA) vs simple (Phi-2)
+            tie_word_embeddings=config.tie_word_embeddings,
+            use_quantized=is_quantized,
+            quantization_bits=quantization_bits,
+            quantization_group_size=quantization_group_size,
         )
-        
+
         # Load weight shards if directory provided
         if self.shard_dir and self.shard_dir.exists():
-            loader = ModelLoader(self.rank, self._world_size)
+
+            loader = ModelLoader(self.rank, self._world_size, quantized=is_quantized)
             await loader.load_shards(self.model, self.shard_dir)
             logger.info(f"Rank {self.rank} loaded model shards from {self.shard_dir}")
         else:

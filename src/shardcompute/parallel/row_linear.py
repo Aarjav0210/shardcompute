@@ -115,7 +115,7 @@ class RowParallelLinear:
     
     def load_shard_direct(
         self,
-        weight_shard: mx.array,
+        weight_shard: Optional[mx.array],
         bias_shard: Optional[mx.array] = None,
     ):
         """
@@ -125,6 +125,11 @@ class RowParallelLinear:
             weight_shard: Pre-sharded weight [local_in_features, out_features]
             bias_shard: Bias [out_features], only used on rank 0
         """
+        # Handle None weight gracefully (skip loading)
+        if weight_shard is None:
+            logger.warning("load_shard_direct called with None weight, skipping")
+            return
+        
         expected_shape = (self.local_in_features, self.out_features)
         if weight_shard.shape != expected_shape:
             raise ValueError(

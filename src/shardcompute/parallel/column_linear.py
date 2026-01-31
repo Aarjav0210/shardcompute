@@ -107,7 +107,7 @@ class ColumnParallelLinear:
     
     def load_shard_direct(
         self,
-        weight_shard: mx.array,
+        weight_shard: Optional[mx.array],
         bias_shard: Optional[mx.array] = None,
     ):
         """
@@ -119,6 +119,11 @@ class ColumnParallelLinear:
             weight_shard: Pre-sharded weight [in_features, local_out_features]
             bias_shard: Pre-sharded bias [local_out_features] or None
         """
+        # Handle None weight gracefully (skip loading)
+        if weight_shard is None:
+            logger.warning("load_shard_direct called with None weight, skipping")
+            return
+        
         expected_shape = (self.in_features, self.local_out_features)
         if weight_shard.shape != expected_shape:
             raise ValueError(

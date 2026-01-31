@@ -7,7 +7,7 @@ import logging
 from shardcompute.collectives.communicator import Communicator
 from shardcompute.parallel.attention import ParallelAttention
 from shardcompute.parallel.mlp import ParallelMLP
-from shardcompute.parallel.embedding import ParallelEmbedding
+from shardcompute.parallel.embedding import ParallelEmbedding, QuantizedParallelEmbedding
 from shardcompute.parallel.column_linear import ColumnParallelLinear
 
 logger = logging.getLogger(__name__)
@@ -15,10 +15,11 @@ logger = logging.getLogger(__name__)
 
 class RMSNorm:
     """
-    Root Mean Square Layer Normalization.
+    Root Mean Square Layer Normalization with optional bias.
     
-    Used in LLaMA instead of LayerNorm. More computationally efficient
-    as it doesn't require computing mean.
+    Used in LLaMA (RMSNorm, no bias) and Phi-2 (LayerNorm-style, with bias).
+    More computationally efficient than LayerNorm as it doesn't require 
+    computing mean (when bias is not used).
     
     RMSNorm is applied locally (no communication needed) as it normalizes
     within each sample independently.
@@ -28,15 +29,21 @@ class RMSNorm:
         self.hidden_size = hidden_size
         self.eps = eps
         self.weight: Optional[mx.array] = None  # [hidden_size]
+        self.bias: Optional[mx.array] = None    # [hidden_size] - optional for LayerNorm-style
     
-    def load_weights(self, weight: mx.array):
-        """Load normalization weights."""
+    def load_weights(self, weight: mx.array, bias: Optional[mx.array] = None):
+        """Load normalization weights and optional bias."""
         if weight.shape != (self.hidden_size,):
             raise ValueError(f"Expected weight shape ({self.hidden_size},), got {weight.shape}")
         self.weight = weight
+        
+        if bias is not None:
+            if bias.shape != (self.hidden_size,):
+                raise ValueError(f"Expected bias shape ({self.hidden_size},), got {bias.shape}")
+            self.bias = bias
     
     def __call__(self, x: mx.array) -> mx.array:
-        """Apply RMS normalization."""
+        """Apply RMS normalization (or LayerNorm-style if bias present)."""
         if self.weight is None:
             raise RuntimeError("Weights not loaded")
         
@@ -44,7 +51,13 @@ class RMSNorm:
         rms = mx.sqrt(mx.mean(x * x, axis=-1, keepdims=True) + self.eps)
         
         # Normalize and scale
-        return (x / rms) * self.weight
+        output = (x / rms) * self.weight
+        
+        # Add bias if present (LayerNorm-style)
+        if self.bias is not None:
+            output = output + self.bias
+        
+        return output
 
 
 class ParallelTransformerBlock:
@@ -83,10 +96,15 @@ class ParallelTransformerBlock:
         mlp_bias: bool = False,
         max_position_embeddings: int = 2048,
         rope_base: float = 10000.0,
+        mlp_activation: str = "silu",
+        use_gated_mlp: bool = True,
+        use_quantized: bool = False,
+        quantization_bits: int = 4,
+        quantization_group_size: int = 64,
     ):
         """
         Initialize ParallelTransformerBlock.
-        
+
         Args:
             layer_idx: Layer index in the model
             hidden_size: Model hidden dimension
@@ -101,15 +119,21 @@ class ParallelTransformerBlock:
             mlp_bias: Whether MLP uses bias
             max_position_embeddings: Maximum sequence length for RoPE
             rope_base: Base frequency for RoPE
+            mlp_activation: Activation function for MLP (silu, gelu, gelu_new)
+            use_gated_mlp: Whether to use gated MLP (LLaMA style)
+            use_quantized: Whether to use quantized linear layers
+            quantization_bits: Bit width for quantization (4 or 8)
+            quantization_group_size: Group size for quantization
         """
         self.layer_idx = layer_idx
         self.hidden_size = hidden_size
         self.world_size = world_size
         self.rank = rank
-        
+        self.use_quantized = use_quantized
+
         # Input layernorm (before attention)
         self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
-        
+
         # Attention
         self.attention = ParallelAttention(
             hidden_size=hidden_size,
@@ -121,11 +145,14 @@ class ParallelTransformerBlock:
             bias=attention_bias,
             max_position_embeddings=max_position_embeddings,
             rope_base=rope_base,
+            use_quantized=use_quantized,
+            quantization_bits=quantization_bits,
+            quantization_group_size=quantization_group_size,
         )
-        
+
         # Post-attention layernorm (before MLP)
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
-        
+
         # MLP
         self.mlp = ParallelMLP(
             hidden_size=hidden_size,
@@ -133,11 +160,14 @@ class ParallelTransformerBlock:
             world_size=world_size,
             rank=rank,
             communicator=communicator,
-            activation="silu",
+            activation=mlp_activation,
             bias=mlp_bias,
-            use_gated=True,
+            use_gated=use_gated_mlp,
+            use_quantized=use_quantized,
+            quantization_bits=quantization_bits,
+            quantization_group_size=quantization_group_size,
         )
-        
+
         logger.debug(f"ParallelTransformerBlock layer {layer_idx} initialized on rank {rank}")
     
     def load_weights(
@@ -264,10 +294,15 @@ class ParallelTransformer:
         rms_norm_eps: float = 1e-5,
         tie_word_embeddings: bool = False,
         rope_base: float = 10000.0,
+        mlp_activation: str = "silu",
+        use_gated_mlp: bool = True,
+        use_quantized: bool = False,
+        quantization_bits: int = 4,
+        quantization_group_size: int = 64,
     ):
         """
         Initialize ParallelTransformer.
-        
+
         Args:
             vocab_size: Vocabulary size
             hidden_size: Model hidden dimension
@@ -282,6 +317,11 @@ class ParallelTransformer:
             rms_norm_eps: Epsilon for RMS normalization
             tie_word_embeddings: Whether to tie input/output embeddings
             rope_base: Base frequency for RoPE
+            mlp_activation: Activation function for MLP
+            use_gated_mlp: Whether to use gated MLP (LLaMA style)
+            use_quantized: Whether to use quantized linear layers
+            quantization_bits: Bit width for quantization (4 or 8)
+            quantization_group_size: Group size for quantization
         """
         self.vocab_size = vocab_size
         self.hidden_size = hidden_size
@@ -290,16 +330,32 @@ class ParallelTransformer:
         self.rank = rank
         self.communicator = communicator
         self.tie_word_embeddings = tie_word_embeddings
-        
-        # Token embeddings (column parallel)
-        self.embed_tokens = ParallelEmbedding(
-            vocab_size=vocab_size,
-            embedding_dim=hidden_size,
-            world_size=world_size,
-            rank=rank,
-            gather_output=True,  # Gather to get full embeddings
-            communicator=communicator,
-        )
+        self.use_quantized = use_quantized
+        self.quantization_bits = quantization_bits
+        self.quantization_group_size = quantization_group_size
+
+        # Token embeddings
+        if use_quantized:
+            # Quantized embeddings use vocabulary parallelism
+            self.embed_tokens = QuantizedParallelEmbedding(
+                vocab_size=vocab_size,
+                embedding_dim=hidden_size,
+                world_size=world_size,
+                rank=rank,
+                communicator=communicator,
+                group_size=quantization_group_size,
+                bits=quantization_bits,
+            )
+        else:
+            # Standard embeddings use column parallelism
+            self.embed_tokens = ParallelEmbedding(
+                vocab_size=vocab_size,
+                embedding_dim=hidden_size,
+                world_size=world_size,
+                rank=rank,
+                gather_output=True,  # Gather to get full embeddings
+                communicator=communicator,
+            )
         
         # Transformer layers
         self.layers: List[ParallelTransformerBlock] = []
@@ -316,6 +372,11 @@ class ParallelTransformer:
                 rms_norm_eps=rms_norm_eps,
                 max_position_embeddings=max_position_embeddings,
                 rope_base=rope_base,
+                mlp_activation=mlp_activation,
+                use_gated_mlp=use_gated_mlp,
+                use_quantized=use_quantized,
+                quantization_bits=quantization_bits,
+                quantization_group_size=quantization_group_size,
             )
             self.layers.append(layer)
         
@@ -342,15 +403,27 @@ class ParallelTransformer:
         )
     
     def load_embedding_weights(self, weight: mx.array):
-        """Load embedding weights."""
+        """Load embedding weights (non-quantized)."""
         self.embed_tokens.load_shard_direct(weight)
-        
+
         # If tied, use same weights for lm_head
         if self.tie_word_embeddings:
             # Transpose for lm_head: [vocab, hidden] -> [hidden, local_vocab]
             # But since we use column parallel, we need [hidden, local_vocab]
             # This is handled by the embedding layer itself
             pass
+
+    def load_quantized_embedding_weights(
+        self,
+        weight: mx.array,
+        scales: mx.array,
+        biases: mx.array,
+    ):
+        """Load quantized embedding weights."""
+        if not self.use_quantized:
+            raise RuntimeError("Cannot load quantized embeddings into non-quantized model")
+
+        self.embed_tokens.load_quantized_shard(weight, scales, biases)
     
     def load_lm_head_weights(self, weight: mx.array):
         """Load LM head weights (if not tied)."""
@@ -409,7 +482,11 @@ class ParallelTransformer:
         # LM head
         if self.tie_word_embeddings:
             # Use embedding weights transposed
-            logits = hidden_states @ self.embed_tokens.weight.T
+            if self.use_quantized and hasattr(self.embed_tokens, "dequantize_weight"):
+                local_weight = self.embed_tokens.dequantize_weight()
+                logits = hidden_states @ local_weight.T
+            else:
+                logits = hidden_states @ self.embed_tokens.weight.T
             # Gather across workers
             logits = await self.communicator.all_gather(logits, dim=-1)
         else:

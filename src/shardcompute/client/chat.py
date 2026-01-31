@@ -4,7 +4,7 @@
 import argparse
 import asyncio
 import sys
-from typing import Optional, List
+from typing import Optional, List, Dict
 import aiohttp
 from rich.console import Console
 from rich.prompt import Prompt
@@ -63,6 +63,9 @@ class ChatClient:
         
         self.console = Console()
         self.session: Optional[aiohttp.ClientSession] = None
+
+        # Conversation history for multi-turn chat
+        self.conversation_history: List[Dict[str, str]] = []
     
     async def connect(self) -> bool:
         """Connect to coordinator and check status."""
@@ -94,23 +97,62 @@ class ChatClient:
         """Disconnect from coordinator."""
         if self.session:
             await self.session.close()
+
+    def _normalize_input_ids(self, tokenized) -> List[int]:
+        """Normalize tokenizer outputs into a JSON-serializable list of ints."""
+        # Handle BatchEncoding-like objects
+        if hasattr(tokenized, "input_ids"):
+            tokenized = tokenized.input_ids
+
+        # If chat template returned a string, tokenize it
+        if isinstance(tokenized, str):
+            if not self.tokenizer:
+                raise ValueError("Tokenizer is required to encode string input.")
+            tokenized = self.tokenizer.encode(tokenized)
+
+        # Convert tensor/array-like to list
+        if hasattr(tokenized, "tolist"):
+            tokenized = tokenized.tolist()
+
+        # If batched, take the first sequence
+        if isinstance(tokenized, (list, tuple)):
+            if tokenized and isinstance(tokenized[0], (list, tuple)):
+                tokenized = tokenized[0]
+            return [int(x) for x in tokenized]
+
+        raise TypeError(f"Unsupported tokenized type: {type(tokenized)}")
     
     async def generate(self, prompt: str) -> Optional[str]:
         """
         Generate response for a prompt.
-        
+
         Args:
             prompt: User prompt
-            
+
         Returns:
             Generated response or None on error
         """
-        # Tokenize
+        # Add user message to conversation history
+        self.conversation_history.append({"role": "user", "content": prompt})
+
+        # Tokenize with chat template if available
         if self.tokenizer:
-            input_ids = self.tokenizer.encode(prompt)
+            if hasattr(self.tokenizer, 'apply_chat_template'):
+                # Use chat template for proper formatting (instruct models)
+                input_ids = self.tokenizer.apply_chat_template(
+                    self.conversation_history,
+                    add_generation_prompt=True,
+                    return_tensors=None,
+                )
+            else:
+                # Fallback to simple encoding
+                input_ids = self.tokenizer.encode(prompt)
         else:
             # Simple fallback: use character codes
             input_ids = [ord(c) % 32000 for c in prompt]
+
+        # Ensure input_ids are JSON-serializable (list of ints)
+        input_ids = self._normalize_input_ids(input_ids)
         
         # Store input length to strip from output
         input_length = len(input_ids)
@@ -161,13 +203,23 @@ class ChatClient:
                         f"[dim]({total_ms:.0f}ms, {tokens_per_sec:.1f} tok/s, {num_generated} tokens)[/dim]"
                     )
                 
+                # Add assistant response to conversation history
+                if response_text:
+                    self.conversation_history.append({"role": "assistant", "content": response_text})
+
                 return response_text
-                
+
         except asyncio.TimeoutError:
             self.console.print("[red]Request timed out[/red]")
+            # Remove the user message since we failed
+            if self.conversation_history and self.conversation_history[-1]["role"] == "user":
+                self.conversation_history.pop()
             return None
         except Exception as e:
             self.console.print(f"[red]Error: {e}[/red]")
+            # Remove the user message since we failed
+            if self.conversation_history and self.conversation_history[-1]["role"] == "user":
+                self.conversation_history.pop()
             return None
     
     async def chat_loop(self):
@@ -175,7 +227,7 @@ class ChatClient:
         self.console.print(Panel(
             "ShardCompute Chat Client\n"
             "Type 'quit' or 'exit' to end the session.\n"
-            "Type 'clear' to clear the screen.",
+            "Type 'clear' to clear screen and conversation history.",
             title="Welcome",
         ))
         
@@ -193,6 +245,8 @@ class ChatClient:
                 
                 if prompt.lower() == "clear":
                     self.console.clear()
+                    self.conversation_history = []
+                    self.console.print("[dim]Conversation cleared[/dim]")
                     continue
                 
                 # Generate response

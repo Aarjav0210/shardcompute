@@ -55,22 +55,129 @@ class WeightSharder:
     ) -> Dict[str, np.ndarray]:
         """
         Shard all weights for a specific rank.
-        
+
         Args:
             weights: Dictionary of weight name -> numpy array
             rank: Worker rank (0 to world_size-1)
-            
+
         Returns:
             Dictionary of sharded weights for this rank
         """
         sharded = {}
-        
+
+        # Track which quantization components we've already handled
+        processed_quant_components = set()
+
         for name, weight in weights.items():
-            sharded_weight = self._shard_weight(name, weight, rank)
-            if sharded_weight is not None:
-                sharded[name] = sharded_weight
-        
+            # Skip quantization components (scales, biases) - they're handled with their main weight
+            if name in processed_quant_components:
+                continue
+
+            # Check if this is a quantized weight (has corresponding scales/biases)
+            scales_key = name.replace(".weight", ".scales") if ".weight" in name else f"{name}.scales"
+            biases_key = name.replace(".weight", ".biases") if ".weight" in name else f"{name}.biases"
+
+            if scales_key in weights and biases_key in weights:
+                # This is a quantized weight - shard weight, scales, and biases together
+                sharded_components = self._shard_quantized_weight(
+                    name, weight, weights[scales_key], weights[biases_key], rank
+                )
+                if sharded_components:
+                    sharded.update(sharded_components)
+                    processed_quant_components.add(scales_key)
+                    processed_quant_components.add(biases_key)
+            elif name.endswith(".scales") or name.endswith(".biases"):
+                # Skip standalone quantization components - handled above
+                continue
+            else:
+                # Regular non-quantized weight
+                sharded_weight = self._shard_weight(name, weight, rank)
+                if sharded_weight is not None:
+                    sharded[name] = sharded_weight
+
         return sharded
+
+    def _shard_quantized_weight(
+        self,
+        name: str,
+        weight: np.ndarray,
+        scales: np.ndarray,
+        biases: np.ndarray,
+        rank: int,
+    ) -> Optional[Dict[str, np.ndarray]]:
+        """
+        Shard a quantized weight along with its scales and biases.
+
+        For column-parallel layers (Q, K, V, up, gate projections):
+            - Weight is sharded along output dimension
+            - Scales and biases are sharded along the same dimension
+
+        For row-parallel layers (O projection, down projection):
+            - Weight is sharded along input dimension
+            - Scales and biases may need different handling based on group alignment
+        """
+        result = {}
+
+        # Determine sharding type based on weight name
+        is_column_parallel = any(x in name for x in [
+            "q_proj", "k_proj", "v_proj", "query", "key", "value",
+            "up_proj", "gate_proj", "fc1", "w1", "w3",
+            "embed_tokens", "wte", "lm_head"
+        ])
+        is_row_parallel = any(x in name for x in [
+            "o_proj", "out_proj", "down_proj", "fc2", "w2"
+        ]) and "mlp" not in name.lower() if "o_proj" in name or "out_proj" in name else any(x in name for x in [
+            "down_proj", "fc2", "w2"
+        ])
+
+        # For quantized weights, we don't transpose - they're already in the right format
+        if is_column_parallel:
+            # Shard along output dimension (dim 0 for quantized weights which are [out, in])
+            sharded_weight = self._column_shard(weight, rank, dim=0)
+            sharded_scales = self._column_shard(scales, rank, dim=0) if len(scales.shape) > 1 else scales.copy()
+            sharded_biases = self._column_shard(biases, rank, dim=0) if len(biases.shape) > 1 else biases.copy()
+        elif is_row_parallel:
+            # Shard along input dimension (dim 1 for quantized weights)
+            sharded_weight = self._row_shard(weight, rank, dim=1)
+            # Shard scales/biases along the same input-group dimension when possible
+            if len(scales.shape) > 1 and scales.shape[1] % self.world_size == 0:
+                sharded_scales = self._row_shard(scales, rank, dim=1)
+            else:
+                if len(scales.shape) > 1:
+                    logger.warning(
+                        f"Row-parallel quant scales not divisible by world size "
+                        f"({scales.shape[1]} vs {self.world_size}); replicating"
+                    )
+                sharded_scales = scales.copy()
+
+            if len(biases.shape) > 1 and biases.shape[1] % self.world_size == 0:
+                sharded_biases = self._row_shard(biases, rank, dim=1)
+            else:
+                if len(biases.shape) > 1:
+                    logger.warning(
+                        f"Row-parallel quant biases not divisible by world size "
+                        f"({biases.shape[1]} vs {self.world_size}); replicating"
+                    )
+                sharded_biases = biases.copy()
+        else:
+            # Unknown - replicate everything
+            logger.warning(f"Unknown quantized weight {name}, replicating")
+            sharded_weight = weight.copy()
+            sharded_scales = scales.copy()
+            sharded_biases = biases.copy()
+
+        # Build result with proper keys
+        weight_key = name if ".weight" in name else f"{name}.weight"
+        scales_key = name.replace(".weight", ".scales") if ".weight" in name else f"{name}.scales"
+        biases_key = name.replace(".weight", ".biases") if ".weight" in name else f"{name}.biases"
+
+        result[weight_key] = sharded_weight
+        result[scales_key] = sharded_scales
+        result[biases_key] = sharded_biases
+
+        logger.debug(f"Sharded quantized weight {name}: {weight.shape} -> {sharded_weight.shape}")
+
+        return result
     
     def _shard_weight(
         self,
@@ -85,6 +192,16 @@ class WeightSharder:
         MLX expects [in_features, out_features].
         We transpose linear weights before sharding to match MLX format.
         """
+        # Handle 1D tensors (biases, some layer norms) - always replicate
+        if len(weight.shape) == 1:
+            logger.debug(f"Replicating 1D tensor: {name} with shape {weight.shape}")
+            return weight.copy()
+        
+        # Handle bias terms explicitly (extra safety check)
+        if "bias" in name.lower():
+            logger.debug(f"Replicating bias: {name} with shape {weight.shape}")
+            return weight.copy()
+        
         # Determine sharding strategy based on weight name
         
         # Embeddings - no transpose needed, column shard on embedding dim
@@ -149,6 +266,11 @@ class WeightSharder:
         Weight shape: [in_features, out_features]
         Sharded shape: [in_features, out_features // world_size]
         """
+        # Defensive check: replicate 1D tensors instead of sharding
+        if len(weight.shape) == 1:
+            logger.warning(f"Attempted to column-shard 1D tensor (shape {weight.shape}), replicating instead")
+            return weight.copy()
+        
         size = weight.shape[dim]
         shard_size = size // self.world_size
         start = rank * shard_size
@@ -175,6 +297,11 @@ class WeightSharder:
         Weight shape: [in_features, out_features]
         Sharded shape: [in_features // world_size, out_features]
         """
+        # Defensive check: replicate 1D tensors instead of sharding
+        if len(weight.shape) == 1:
+            logger.warning(f"Attempted to row-shard 1D tensor (shape {weight.shape}), replicating instead")
+            return weight.copy()
+        
         size = weight.shape[dim]
         shard_size = size // self.world_size
         start = rank * shard_size
