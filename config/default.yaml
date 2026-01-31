@@ -6,6 +6,7 @@ coordinator:
   port: 8080
   heartbeat_interval_seconds: 5
   heartbeat_timeout_seconds: 15
+  tokenizer_path: "./model_cache_mlx_Llama_3b_Instruct_4bit"  # Enable /api/inference/text
 
 worker:
   collective_port_base: 9000  # Worker N uses port 9000 + N for peer connections

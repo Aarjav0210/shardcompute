@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>ShardCompute Metropolis Console</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Bebas+Neue&family=Space+Grotesk:wght@400;500;600;700&display=swap"
+      rel="stylesheet"
+    />
+    <link rel="stylesheet" href="/static/styles.css" />
+  </head>
+  <body>
+    <div class="scene">
+      <div class="orb orb-a"></div>
+      <div class="orb orb-b"></div>
+      <div class="orb orb-c"></div>
+      <header class="hero">
+        <div class="hero-top">
+          <span class="eyebrow">ShardCompute Coordinator</span>
+          <span class="badge" id="status-badge">Linking...</span>
+        </div>
+        <h1>Metropolis Control Deck</h1>
+        <p>
+          A skyline-inspired console for orchestrating distributed inference.
+          Monitor the grid, tune the flow, and launch prompts from a single
+          neon-lit hub.
+        </p>
+        <div class="hero-actions">
+          <button class="ghost" id="refresh-btn" type="button">Refresh</button>
+          <button class="ghost" id="clear-btn" type="button">Clear Feed</button>
+        </div>
+      </header>
+
+      <main class="grid">
+        <section class="card status" style="--delay: 0.05s">
+          <div class="card-header">
+            <h2>Cluster Pulse</h2>
+            <span class="chip" id="health-chip">checking</span>
+          </div>
+          <div class="status-grid">
+            <div>
+              <p class="label">Status</p>
+              <p class="value" id="status-value">--</p>
+            </div>
+            <div>
+              <p class="label">Workers</p>
+              <p class="value" id="workers-value">--</p>
+            </div>
+            <div>
+              <p class="label">Expected</p>
+              <p class="value" id="expected-value">--</p>
+            </div>
+            <div>
+              <p class="label">Latency (avg)</p>
+              <p class="value" id="latency-value">--</p>
+            </div>
+            <div>
+              <p class="label">Throughput</p>
+              <p class="value" id="throughput-value">--</p>
+            </div>
+            <div>
+              <p class="label">Total Requests</p>
+              <p class="value" id="requests-value">--</p>
+            </div>
+          </div>
+          <div class="hint" id="status-hint">Listening for the city grid.</div>
+        </section>
+
+        <section class="card control" style="--delay: 0.12s">
+          <div class="card-header">
+            <h2>Prompt Launch</h2>
+            <span class="chip ghost">text mode</span>
+          </div>
+          <form id="prompt-form">
+            <label class="label" for="prompt-input">Command</label>
+            <textarea
+              id="prompt-input"
+              rows="4"
+              placeholder="Draft a prompt for the cluster..."
+            ></textarea>
+            <div class="settings">
+              <div>
+                <label class="label" for="max-tokens">Max tokens</label>
+                <input id="max-tokens" type="number" min="16" max="512" value="160" />
+              </div>
+              <div>
+                <label class="label" for="temperature">
+                  Temperature <span id="temp-value">0.70</span>
+                </label>
+                <input
+                  id="temperature"
+                  type="range"
+                  min="0.1"
+                  max="1.5"
+                  step="0.05"
+                  value="0.7"
+                />
+              </div>
+              <div>
+                <label class="label" for="top-p">
+                  Top P <span id="top-p-value">0.90</span>
+                </label>
+                <input
+                  id="top-p"
+                  type="range"
+                  min="0.1"
+                  max="1.0"
+                  step="0.05"
+                  value="0.9"
+                />
+              </div>
+            </div>
+            <div class="actions">
+              <button type="submit" id="send-btn">Send to Grid</button>
+              <button type="button" class="ghost" id="sample-btn">
+                Load Sample
+              </button>
+            </div>
+            <p class="note" id="tokenizer-note">
+              Configure a tokenizer in the coordinator config for best text
+              results.
+            </p>
+          </form>
+        </section>
+
+        <section class="card stream" style="--delay: 0.2s">
+          <div class="card-header">
+            <h2>City Feed</h2>
+            <span class="chip" id="feed-chip">idle</span>
+          </div>
+          <div id="messages" class="messages" aria-live="polite"></div>
+          <div class="hint" id="feed-hint">
+            Responses will appear here once the cluster answers.
+          </div>
+        </section>
+      </main>
+
+      <div class="skyline">
+        <div class="tower"></div>
+        <div class="tower"></div>
+        <div class="tower tall"></div>
+        <div class="tower"></div>
+        <div class="tower wide"></div>
+        <div class="tower"></div>
+        <div class="tower tall"></div>
+      </div>
+
+      <footer class="footer">
+        <span>ShardCompute UI</span>
+        <span class="dot">•</span>
+        <span>Metropolis build</span>
+      </footer>
+    </div>
+    <script src="/static/app.js"></script>
+  </body>
+</html>

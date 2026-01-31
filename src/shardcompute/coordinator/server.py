@@ -5,7 +5,7 @@ import logging
 import signal
 import argparse
 import uuid
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from pathlib import Path
 import yaml
 from aiohttp import web
@@ -16,6 +16,20 @@ from shardcompute.coordinator.metrics import MetricsAggregator
 from shardcompute.protocol.messages import WorkerInfo, InferenceRequest, InferenceResponse
 
 logger = logging.getLogger(__name__)
+
+try:
+    from transformers import AutoTokenizer
+    HAS_TOKENIZER = True
+except Exception:
+    HAS_TOKENIZER = False
+
+
+class InferenceError(Exception):
+    """Inference error that carries an HTTP status."""
+
+    def __init__(self, message: str, status: int):
+        super().__init__(message)
+        self.status = status
 
 
 class CoordinatorServer:
@@ -69,6 +83,9 @@ class CoordinatorServer:
         )
         
         self.metrics = MetricsAggregator()
+
+        # Optional tokenizer for text UI
+        self.tokenizer = self._load_tokenizer()
         
         # Inference queue
         self._pending_requests: asyncio.Queue = asyncio.Queue()
@@ -77,6 +94,8 @@ class CoordinatorServer:
         
         # HTTP app
         self.app = web.Application()
+        self._static_path = Path(__file__).parent / "static"
+        self._index_path = self._static_path / "index.html"
         self._setup_routes()
         
         # State
@@ -98,9 +117,10 @@ class CoordinatorServer:
         self.app.router.add_post("/api/workers/register", self._handle_register)
         self.app.router.add_get("/api/workers/list", self._handle_list_workers)
         self.app.router.add_post("/api/heartbeat", self._handle_heartbeat)
-        
+
         # Inference
         self.app.router.add_post("/api/inference", self._handle_inference)
+        self.app.router.add_post("/api/inference/text", self._handle_inference_text)
         self.app.router.add_get("/api/inference/poll", self._handle_poll)
         self.app.router.add_post("/api/inference/response", self._handle_response)
         self.app.router.add_get("/api/inference/{request_id}", self._handle_get_result)
@@ -109,9 +129,12 @@ class CoordinatorServer:
         self.app.router.add_get("/api/status", self._handle_status)
         self.app.router.add_get("/api/metrics", self._handle_metrics)
         self.app.router.add_get("/api/health", self._handle_health)
-        
+
         # Root
         self.app.router.add_get("/", self._handle_root)
+        self.app.router.add_get("/ui", self._handle_ui)
+        if self._static_path.exists():
+            self.app.router.add_static("/static", self._static_path)
     
     async def start(self):
         """Start the coordinator server."""
@@ -165,12 +188,22 @@ class CoordinatorServer:
     
     async def _handle_root(self, request: web.Request) -> web.Response:
         """Handle root endpoint."""
-        return web.json_response({
-            "service": "ShardCompute Coordinator",
-            "status": "running" if self._running else "stopped",
-            "cluster_ready": self.registry.is_cluster_ready,
-            "workers": self.registry.worker_count,
-        })
+        accept = request.headers.get("Accept", "")
+        wants_json = "application/json" in accept or request.query.get("json") == "1"
+        if wants_json:
+            return web.json_response({
+                "service": "ShardCompute Coordinator",
+                "status": "running" if self._running else "stopped",
+                "cluster_ready": self.registry.is_cluster_ready,
+                "workers": self.registry.worker_count,
+            })
+        return await self._handle_ui(request)
+
+    async def _handle_ui(self, request: web.Request) -> web.Response:
+        """Serve the UI."""
+        if self._index_path.exists():
+            return web.FileResponse(self._index_path)
+        return web.Response(text="UI assets not found", status=404)
     
     async def _handle_register(self, request: web.Request) -> web.Response:
         """Handle worker registration."""
@@ -231,76 +264,64 @@ class CoordinatorServer:
     async def _handle_inference(self, request: web.Request) -> web.Response:
         """Handle inference request from client."""
         try:
-            if not self.registry.is_cluster_ready:
-                return web.json_response(
-                    {"error": "Cluster not ready"},
-                    status=503,
-                )
-            
-            if not self.health_monitor.is_cluster_healthy():
-                return web.json_response(
-                    {"error": "Cluster unhealthy"},
-                    status=503,
-                )
-            
             data = await request.json()
-            
-            # Create request
-            request_id = str(uuid.uuid4())
-            inference_request = InferenceRequest(
-                request_id=request_id,
+            response = await self._run_inference(
                 input_ids=data["input_ids"],
                 max_new_tokens=data.get("max_new_tokens", 100),
                 temperature=data.get("temperature", 0.7),
                 top_p=data.get("top_p", 0.9),
-                stop_tokens=data.get("stop_tokens", [2]),  # Default to EOS token
+                stop_tokens=data.get("stop_tokens", [2]),
+                timeout=data.get("timeout", 300),
             )
-            
-            # Create event for response
-            self._request_events[request_id] = asyncio.Event()
-            
-            # Queue request
-            await self._pending_requests.put(inference_request)
-            
-            logger.info(f"Inference request queued: {request_id}")
-            
-            # Wait for response (with timeout)
-            timeout = data.get("timeout", 300)
-            try:
-                await asyncio.wait_for(
-                    self._request_events[request_id].wait(),
-                    timeout=timeout,
-                )
-            except asyncio.TimeoutError:
-                return web.json_response(
-                    {"error": "Inference timeout"},
-                    status=504,
-                )
-            
-            # Get response
-            response = self._completed_requests.pop(request_id, None)
-            del self._request_events[request_id]
-            
-            if response is None:
-                return web.json_response(
-                    {"error": "Response not found"},
-                    status=500,
-                )
-            
-            if response.error:
-                return web.json_response(
-                    {"error": response.error},
-                    status=500,
-                )
-            
             return web.json_response({
                 "request_id": response.request_id,
                 "output_ids": response.output_ids,
                 "timing": response.timing,
             })
-            
+        except InferenceError as e:
+            return web.json_response({"error": str(e)}, status=e.status)
         except Exception as e:
             logger.error(f"Inference error: {e}")
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_inference_text(self, request: web.Request) -> web.Response:
+        """Handle text inference request from UI clients."""
+        try:
+            data = await request.json()
+            prompt = str(data.get("prompt", "")).strip()
+            messages = data.get("messages")
+            if not prompt and not messages:
+                return web.json_response(
+                    {"error": "Prompt or messages required"},
+                    status=400,
+                )
+
+            input_ids = self._encode_prompt(prompt, messages)
+            input_length = len(input_ids)
+
+            response = await self._run_inference(
+                input_ids=input_ids,
+                max_new_tokens=data.get("max_new_tokens", 120),
+                temperature=data.get("temperature", 0.7),
+                top_p=data.get("top_p", 0.9),
+                stop_tokens=data.get("stop_tokens", self._default_stop_tokens()),
+                timeout=data.get("timeout", 300),
+            )
+
+            output_ids = response.output_ids
+            generated_ids = output_ids[input_length:] if len(output_ids) > input_length else output_ids
+            output_text = self._decode_output(generated_ids)
+
+            return web.json_response({
+                "request_id": response.request_id,
+                "output_text": output_text,
+                "output_ids": output_ids,
+                "timing": response.timing,
+            })
+        except InferenceError as e:
+            return web.json_response({"error": str(e)}, status=e.status)
+        except Exception as e:
+            logger.error(f"Text inference error: {e}")
             return web.json_response({"error": str(e)}, status=500)
     
     async def _handle_poll(self, request: web.Request) -> web.Response:
@@ -392,6 +413,140 @@ class CoordinatorServer:
         status = 200 if self.health_monitor.is_cluster_healthy() else 503
         
         return web.json_response(health, status=status)
+
+    def _load_tokenizer(self):
+        """Load tokenizer if configured."""
+        tokenizer_path = (
+            self.config.get("coordinator", {}).get("tokenizer_path")
+            or self.config.get("model", {}).get("tokenizer_path")
+        )
+        if not tokenizer_path:
+            return None
+        if not HAS_TOKENIZER:
+            logger.warning("Transformers not available; tokenizer disabled")
+            return None
+        try:
+            tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+            logger.info(f"Tokenizer loaded from {tokenizer_path}")
+            return tokenizer
+        except Exception as e:
+            logger.warning(f"Tokenizer load failed: {e}")
+            return None
+
+    def _default_stop_tokens(self) -> List[int]:
+        """Resolve stop tokens for text inference."""
+        if self.tokenizer and hasattr(self.tokenizer, "eos_token_id"):
+            eos_id = self.tokenizer.eos_token_id
+            if eos_id is not None:
+                return [int(eos_id)]
+        return [2]
+
+    def _normalize_input_ids(self, tokenized) -> List[int]:
+        """Normalize tokenizer outputs into a list of ints."""
+        if hasattr(tokenized, "input_ids"):
+            tokenized = tokenized.input_ids
+
+        if isinstance(tokenized, str):
+            if not self.tokenizer:
+                raise ValueError("Tokenizer is required to encode string input.")
+            tokenized = self.tokenizer.encode(tokenized)
+
+        if hasattr(tokenized, "tolist"):
+            tokenized = tokenized.tolist()
+
+        if isinstance(tokenized, (list, tuple)):
+            if tokenized and isinstance(tokenized[0], (list, tuple)):
+                tokenized = tokenized[0]
+            return [int(x) for x in tokenized]
+
+        raise TypeError(f"Unsupported tokenized type: {type(tokenized)}")
+
+    def _encode_prompt(self, prompt: str, messages) -> List[int]:
+        """Encode prompt or messages into token ids."""
+        if self.tokenizer and messages and hasattr(self.tokenizer, "apply_chat_template"):
+            cleaned = []
+            if isinstance(messages, list):
+                for message in messages:
+                    if isinstance(message, dict) and "role" in message and "content" in message:
+                        cleaned.append({
+                            "role": str(message["role"]),
+                            "content": str(message["content"]),
+                        })
+            if cleaned:
+                tokenized = self.tokenizer.apply_chat_template(
+                    cleaned,
+                    add_generation_prompt=True,
+                    return_tensors=None,
+                )
+                return self._normalize_input_ids(tokenized)
+
+        if not prompt and messages:
+            prompt = "\n".join(
+                f"{m.get('role', 'user')}: {m.get('content', '')}"
+                for m in messages
+                if isinstance(m, dict)
+            )
+
+        if self.tokenizer:
+            tokenized = self.tokenizer.encode(prompt)
+            return self._normalize_input_ids(tokenized)
+
+        return [ord(c) % 32000 for c in prompt]
+
+    def _decode_output(self, output_ids: List[int]) -> str:
+        """Decode generated tokens into text."""
+        if self.tokenizer:
+            return self.tokenizer.decode(output_ids, skip_special_tokens=True)
+        return "".join(chr(min(i, 127)) for i in output_ids)
+
+    async def _run_inference(
+        self,
+        input_ids: List[int],
+        max_new_tokens: int,
+        temperature: float,
+        top_p: float,
+        stop_tokens: List[int],
+        timeout: int,
+    ) -> InferenceResponse:
+        """Queue inference and await a response."""
+        if not self.registry.is_cluster_ready:
+            raise InferenceError("Cluster not ready", 503)
+
+        if not self.health_monitor.is_cluster_healthy():
+            raise InferenceError("Cluster unhealthy", 503)
+
+        request_id = str(uuid.uuid4())
+        inference_request = InferenceRequest(
+            request_id=request_id,
+            input_ids=input_ids,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            stop_tokens=stop_tokens,
+        )
+
+        self._request_events[request_id] = asyncio.Event()
+        await self._pending_requests.put(inference_request)
+        logger.info(f"Inference request queued: {request_id}")
+
+        try:
+            await asyncio.wait_for(
+                self._request_events[request_id].wait(),
+                timeout=timeout,
+            )
+        except asyncio.TimeoutError as e:
+            self._request_events.pop(request_id, None)
+            raise InferenceError("Inference timeout", 504) from e
+
+        response = self._completed_requests.pop(request_id, None)
+        self._request_events.pop(request_id, None)
+
+        if response is None:
+            raise InferenceError("Response not found", 500)
+        if response.error:
+            raise InferenceError(response.error, 500)
+
+        return response
 
 
 def main():

@@ -137,6 +137,12 @@ python scripts/benchmark.py \
     --num-requests 50
 ```
 
+### Web UI
+
+Open `http://localhost:8080` in a browser to use the Metropolis console. For
+text prompts, set `coordinator.tokenizer_path` in `config/default.yaml` to a
+local tokenizer folder or model id.
+
 ## Project Structure
 
 ```
