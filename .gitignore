@@ -35,8 +35,8 @@ ENV/
 .DS_Store
 
 # Model artifacts (these are large!)
-model_cache/
-model_shards/
+model_cache*/
+model_shards*/
 *.safetensors
 *.bin
 *.pt

@@ -108,15 +108,7 @@ class PeerMesh:
             return True
         
         logger.info(f"Rank {self.rank} connecting to peer mesh")
-        
-        # Create communicator
-        self.communicator = Communicator(
-            rank=self.rank,
-            world_size=self.config.world_size,
-            host=self.host,
-            port=self.port,
-        )
-        
+
         # Build peer info list for communicator
         peer_info_list = [None] * self.config.world_size
         peer_info_list[self.rank] = PeerInfo(
@@ -124,12 +116,20 @@ class PeerMesh:
             host=self.host,
             port=self.port,
         )
-        
+
         for peer_rank, peer_info in self.peers.items():
             peer_info_list[peer_rank] = peer_info
-        
+
         # Attempt connection with retries
         for attempt in range(self.config.retry_attempts):
+            # Create a fresh communicator for each attempt
+            self.communicator = Communicator(
+                rank=self.rank,
+                world_size=self.config.world_size,
+                host=self.host,
+                port=self.port,
+            )
+
             try:
                 await self.communicator.initialize(
                     peer_info_list,
@@ -138,11 +138,14 @@ class PeerMesh:
                 self._connected = True
                 logger.info(f"Rank {self.rank} mesh connected successfully")
                 return True
-                
+
             except Exception as e:
                 logger.warning(
                     f"Rank {self.rank} connection attempt {attempt + 1} failed: {e}"
                 )
+                # Clean up the failed communicator to release the bound port
+                await self.communicator.shutdown()
+                self.communicator = None
                 if attempt < self.config.retry_attempts - 1:
                     await asyncio.sleep(self.config.retry_delay)
         
