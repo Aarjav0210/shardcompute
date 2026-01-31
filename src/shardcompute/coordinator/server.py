@@ -250,9 +250,10 @@ class CoordinatorServer:
             inference_request = InferenceRequest(
                 request_id=request_id,
                 input_ids=data["input_ids"],
-                max_new_tokens=data.get("max_new_tokens", 256),
+                max_new_tokens=data.get("max_new_tokens", 100),
                 temperature=data.get("temperature", 0.7),
                 top_p=data.get("top_p", 0.9),
+                stop_tokens=data.get("stop_tokens", [2]),  # Default to EOS token
             )
             
             # Create event for response

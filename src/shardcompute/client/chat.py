@@ -28,9 +28,10 @@ class ChatClient:
         self,
         coordinator_url: str,
         tokenizer_path: Optional[str] = None,
-        max_new_tokens: int = 256,
+        max_new_tokens: int = 100,
         temperature: float = 0.7,
         top_p: float = 0.9,
+        stop_tokens: Optional[List[int]] = None,
     ):
         """
         Initialize ChatClient.
@@ -41,17 +42,22 @@ class ChatClient:
             max_new_tokens: Maximum tokens to generate
             temperature: Sampling temperature
             top_p: Nucleus sampling threshold
+            stop_tokens: Token IDs that stop generation (default: [2] for EOS)
         """
         self.coordinator_url = coordinator_url.rstrip("/")
         self.max_new_tokens = max_new_tokens
         self.temperature = temperature
         self.top_p = top_p
+        self.stop_tokens = stop_tokens if stop_tokens is not None else [2]  # Default EOS for Llama
         
         # Load tokenizer if available
         self.tokenizer = None
         if tokenizer_path and HAS_TOKENIZER:
             try:
                 self.tokenizer = AutoTokenizer.from_pretrained(tokenizer_path)
+                # Try to get EOS token from tokenizer
+                if hasattr(self.tokenizer, 'eos_token_id') and self.tokenizer.eos_token_id is not None:
+                    self.stop_tokens = [self.tokenizer.eos_token_id]
             except Exception as e:
                 print(f"Warning: Could not load tokenizer: {e}")
         
@@ -115,6 +121,7 @@ class ChatClient:
             "max_new_tokens": self.max_new_tokens,
             "temperature": self.temperature,
             "top_p": self.top_p,
+            "stop_tokens": self.stop_tokens,
         }
         
         try:
@@ -243,7 +250,7 @@ def main():
     parser.add_argument(
         "--max-tokens",
         type=int,
-        default=256,
+        default=100,
         help="Maximum tokens to generate",
     )
     parser.add_argument(

@@ -125,9 +125,10 @@ class InferenceRequest:
     
     request_id: str
     input_ids: List[int]
-    max_new_tokens: int = 256
+    max_new_tokens: int = 100
     temperature: float = 0.7
     top_p: float = 0.9
+    stop_tokens: List[int] = field(default_factory=lambda: [2])  # Default EOS token for Llama
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
@@ -137,6 +138,7 @@ class InferenceRequest:
             "max_new_tokens": self.max_new_tokens,
             "temperature": self.temperature,
             "top_p": self.top_p,
+            "stop_tokens": self.stop_tokens,
         }
     
     @classmethod
@@ -145,9 +147,10 @@ class InferenceRequest:
         return cls(
             request_id=data["request_id"],
             input_ids=data["input_ids"],
-            max_new_tokens=data.get("max_new_tokens", 256),
+            max_new_tokens=data.get("max_new_tokens", 100),
             temperature=data.get("temperature", 0.7),
             top_p=data.get("top_p", 0.9),
+            stop_tokens=data.get("stop_tokens", [2]),
         )
 
 

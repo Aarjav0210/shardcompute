@@ -226,7 +226,7 @@ class ParallelExecutor:
     async def generate(
         self,
         input_ids: mx.array,
-        max_new_tokens: int = 256,
+        max_new_tokens: int = 100,
         temperature: float = 0.7,
         top_p: float = 0.9,
         stop_tokens: Optional[List[int]] = None,

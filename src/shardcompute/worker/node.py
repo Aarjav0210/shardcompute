@@ -339,7 +339,7 @@ class WorkerNode:
         while self._running:
             try:
                 # Wait for generation parameters broadcast from rank 0
-                # Format: [input_ids_len, max_new_tokens, temperature (scaled), top_p (scaled)]
+                # Format: [input_ids_len, max_new_tokens, temperature (scaled), top_p (scaled), num_stop_tokens]
                 comm = self.peer_mesh.get_communicator()
                 params = await comm.broadcast(None, root=0)
                 
@@ -353,12 +353,19 @@ class WorkerNode:
                 max_new_tokens = int(params_list[1]) if len(params_list) > 1 else 0
                 temperature = float(params_list[2]) / 1000.0 if len(params_list) > 2 else 0.7
                 top_p = float(params_list[3]) / 1000.0 if len(params_list) > 3 else 0.9
+                num_stop_tokens = int(params_list[4]) if len(params_list) > 4 else 0
+                
+                # Receive stop tokens if any
+                stop_tokens = []
+                if num_stop_tokens > 0:
+                    stop_tokens_array = await comm.broadcast(None, root=0)
+                    stop_tokens = stop_tokens_array.tolist()
                 
                 # Receive actual input_ids
                 input_ids = await comm.broadcast(None, root=0)
                 
                 logger.info(f"Rank {self.rank} starting generation: {input_len} input tokens, "
-                           f"{max_new_tokens} max new tokens")
+                           f"{max_new_tokens} max new tokens, stop_tokens={stop_tokens}")
                 
                 # Execute same operation as rank 0
                 if max_new_tokens > 0:
@@ -367,6 +374,7 @@ class WorkerNode:
                         max_new_tokens=max_new_tokens,
                         temperature=temperature,
                         top_p=top_p,
+                        stop_tokens=stop_tokens,
                     )
                 else:
                     await self.executor.forward(input_ids)
@@ -390,19 +398,29 @@ class WorkerNode:
                 
                 # Broadcast parameters to followers so they know what to do
                 comm = self.peer_mesh.get_communicator()
+                
+                # First broadcast number of stop tokens
+                num_stop_tokens = len(request.stop_tokens) if request.stop_tokens else 0
                 params = mx.array([
                     len(request.input_ids),
                     request.max_new_tokens,
                     int(request.temperature * 1000),  # Scale to int for easier transfer
                     int(request.top_p * 1000),
+                    num_stop_tokens,
                 ], dtype=mx.int32)
                 await comm.broadcast(params, root=0)
+                
+                # Broadcast stop tokens if any
+                if num_stop_tokens > 0:
+                    stop_tokens_array = mx.array(request.stop_tokens, dtype=mx.int32)
+                    await comm.broadcast(stop_tokens_array, root=0)
                 
                 # Broadcast input to all workers
                 await comm.broadcast(input_ids, root=0)
                 
                 logger.info(f"Rank 0 starting generation: {len(request.input_ids)} input tokens, "
-                           f"{request.max_new_tokens} max new tokens")
+                           f"{request.max_new_tokens} max new tokens, "
+                           f"stop_tokens={request.stop_tokens}")
                 
                 # Execute inference
                 if request.max_new_tokens > 0:
@@ -411,6 +429,7 @@ class WorkerNode:
                         max_new_tokens=request.max_new_tokens,
                         temperature=request.temperature,
                         top_p=request.top_p,
+                        stop_tokens=request.stop_tokens,
                     )
                 else:
                     # Just forward pass
