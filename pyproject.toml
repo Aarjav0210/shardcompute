@@ -1,0 +1,61 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "shardcompute"
+version = "0.1.0"
+description = "Distributed Tensor Parallelism for Apple Silicon"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.11"
+authors = [
+    {name = "ShardCompute Team"}
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "mlx>=0.12.0",
+    "numpy>=1.24.0",
+    "aiohttp>=3.9.0",
+    "msgpack>=1.0.0",
+    "safetensors>=0.4.0",
+    "transformers>=4.36.0",
+    "huggingface-hub>=0.20.0",
+    "rich>=13.0.0",
+    "pyyaml>=6.0.0",
+    "pytest>=7.4.0",
+    "pytest-asyncio>=0.21.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+    "mypy>=1.0.0",
+]
+
+[project.scripts]
+shardcompute-coordinator = "shardcompute.coordinator.server:main"
+shardcompute-worker = "shardcompute.worker.node:main"
+shardcompute-chat = "shardcompute.client.chat:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.black]
+line-length = 100
+target-version = ["py311"]
+
+[tool.ruff]
+line-length = 100
+select = ["E", "F", "W", "I"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
