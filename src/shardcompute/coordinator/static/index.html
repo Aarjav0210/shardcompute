@@ -66,6 +66,13 @@
               <p class="value" id="requests-value">--</p>
             </div>
           </div>
+          <div class="chart">
+            <div class="chart-header">
+              <span class="label">Token Flux</span>
+              <span class="chart-value" id="tokens-per-sec">-- tok/s</span>
+            </div>
+            <canvas id="token-chart" height="120"></canvas>
+          </div>
           <div class="hint" id="status-hint">Listening for the city grid.</div>
         </section>
 
@@ -154,6 +161,7 @@
         <span>Metropolis build</span>
       </footer>
     </div>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
     <script src="/static/app.js"></script>
   </body>
 </html>

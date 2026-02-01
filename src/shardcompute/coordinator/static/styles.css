@@ -235,6 +235,38 @@ button.ghost {
   gap: 16px;
 }
 
+.chart {
+  margin-top: 20px;
+  padding-top: 8px;
+  border-top: 1px solid rgba(10, 26, 47, 0.08);
+  height: 140px;
+  min-height: 140px;
+  max-height: 140px;
+  overflow: hidden;
+  display: grid;
+  grid-template-rows: auto 1fr;
+  gap: 6px;
+}
+
+.chart-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 0;
+}
+
+.chart-value {
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.chart canvas {
+  width: 100%;
+  height: 100% !important;
+  display: block;
+}
+
 .hint,
 .note {
   margin-top: 18px;

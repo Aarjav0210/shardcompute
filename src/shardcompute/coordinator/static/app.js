@@ -10,6 +10,8 @@ const statusHint = document.getElementById("status-hint");
 const messagesEl = document.getElementById("messages");
 const feedChip = document.getElementById("feed-chip");
 const feedHint = document.getElementById("feed-hint");
+const tokenChart = document.getElementById("token-chart");
+const tokensPerSecEl = document.getElementById("tokens-per-sec");
 
 const promptForm = document.getElementById("prompt-form");
 const promptInput = document.getElementById("prompt-input");
@@ -28,6 +30,11 @@ const tokenizerNote = document.getElementById("tokenizer-note");
 
 const conversation = [];
 let busy = false;
+let liveTokenCount = 0;
+const tokenSeries = [];
+const maxSeriesPoints = 40;
+const tokenSamplerMs = 1000;
+let tokenChartInstance = null;
 
 const SAMPLE_PROMPT =
   "Draft a 4-line status update in the voice of a city power grid operator.";
@@ -123,6 +130,61 @@ const updateRanges = () => {
   topPValue.textContent = Number(topPInput.value).toFixed(2);
 };
 
+const initTokenChart = () => {
+  if (!tokenChart || typeof Chart === "undefined") {
+    return;
+  }
+  const ctx = tokenChart.getContext("2d");
+  if (!ctx) {
+    return;
+  }
+
+  tokenChartInstance = new Chart(ctx, {
+    type: "line",
+    data: {
+      labels: [],
+      datasets: [
+        {
+          data: [],
+          borderColor: "rgba(0, 194, 255, 0.95)",
+          borderWidth: 2,
+          fill: false,
+          tension: 0.35,
+          pointRadius: (ctx) =>
+            ctx.dataIndex === ctx.dataset.data.length - 1 ? 2.5 : 0,
+          pointBackgroundColor: "rgba(46, 229, 157, 0.9)",
+          pointHoverRadius: 3,
+        },
+      ],
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      animation: false,
+      plugins: {
+        legend: { display: false },
+        tooltip: { enabled: false },
+      },
+      scales: {
+        x: { display: false, grid: { display: false, drawBorder: false } },
+        y: {
+          display: false,
+          grid: { display: false, drawBorder: false },
+        },
+      },
+    },
+  });
+};
+
+const updateTokenChart = () => {
+  if (!tokenChartInstance) {
+    return;
+  }
+  tokenChartInstance.data.labels = tokenSeries.map((_, index) => index + 1);
+  tokenChartInstance.data.datasets[0].data = tokenSeries;
+  tokenChartInstance.update("none");
+};
+
 const setBusy = (state) => {
   busy = state;
   sendBtn.disabled = state;
@@ -185,6 +247,7 @@ const sendPrompt = async (prompt) => {
             if (parsed.token) {
               fullText += parsed.token;
               appendToMessage(messageWrapper, parsed.token);
+              liveTokenCount += 1;
             } else if (parsed.error) {
               throw new Error(parsed.error);
             }
@@ -252,7 +315,19 @@ temperatureInput.addEventListener("input", updateRanges);
 topPInput.addEventListener("input", updateRanges);
 
 updateRanges();
+initTokenChart();
 refreshStatus();
 refreshMetrics();
 setInterval(refreshStatus, 5000);
 setInterval(refreshMetrics, 8000);
+setInterval(() => {
+  const tps = liveTokenCount / (tokenSamplerMs / 1000);
+  tokenSeries.push(tps);
+  if (tokenSeries.length > maxSeriesPoints) {
+    tokenSeries.shift();
+  }
+  tokensPerSecEl.textContent = `${formatNumber(tps, 1)} tok/s`;
+  updateTokenChart();
+  liveTokenCount = 0;
+}, tokenSamplerMs);
+window.addEventListener("resize", updateTokenChart);
