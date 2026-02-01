@@ -62,6 +62,15 @@ const addMessage = (role, text, meta) => {
   wrapper.appendChild(body);
   messagesEl.appendChild(wrapper);
   messagesEl.scrollTop = messagesEl.scrollHeight;
+  return wrapper;
+};
+
+const appendToMessage = (messageWrapper, text) => {
+  const body = messageWrapper.querySelector("div:last-child");
+  if (body) {
+    body.textContent += text;
+    messagesEl.scrollTop = messagesEl.scrollHeight;
+  }
 };
 
 const refreshStatus = async () => {
@@ -98,10 +107,9 @@ const refreshMetrics = async () => {
     const summary = data.summary || {};
 
     latencyValue.textContent = `${formatNumber(summary.avg_latency_ms)} ms`;
-    throughputValue.textContent = `${formatNumber(
-      summary.avg_throughput_tokens_per_sec,
-      1
-    )} tok/s`;
+    const avgThroughput = formatNumber(summary.avg_throughput_tokens_per_sec, 1);
+    const lastThroughput = formatNumber(summary.last_throughput_tokens_per_sec, 1);
+    throughputValue.textContent = `${avgThroughput} tok/s (prev: ${lastThroughput})`;
     requestsValue.textContent = summary.total_requests ?? "--";
   } catch (error) {
     latencyValue.textContent = "--";
@@ -136,26 +144,70 @@ const sendPrompt = async (prompt) => {
     top_p: Number(topPInput.value || 0.9),
   };
 
+  let messageWrapper = null;
+  let fullText = "";
+
   try {
-    const response = await fetch("/api/inference/text", {
+    const response = await fetch("/api/inference/text/stream", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),
     });
 
-    const data = await response.json();
     if (!response.ok) {
-      throw new Error(data.error || "Inference failed");
+      throw new Error("Inference failed");
     }
 
-    if (data.output_text) {
-      addMessage("assistant", data.output_text, "grid");
-      conversation.push({ role: "assistant", content: data.output_text });
+    feedHint.textContent = "Streaming response from the grid...";
+
+    // Create message wrapper for streaming
+    messageWrapper = addMessage("assistant", "", "grid");
+
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+
+      for (const line of lines) {
+        if (line.startsWith("event: token")) {
+          continue;
+        } else if (line.startsWith("data: ")) {
+          const data = line.slice(6);
+          try {
+            const parsed = JSON.parse(data);
+            if (parsed.token) {
+              fullText += parsed.token;
+              appendToMessage(messageWrapper, parsed.token);
+            } else if (parsed.error) {
+              throw new Error(parsed.error);
+            }
+          } catch (e) {
+            if (e.message !== "Unexpected end of JSON input") {
+              console.error("Parse error:", e);
+            }
+          }
+        }
+      }
+    }
+
+    if (fullText) {
+      conversation.push({ role: "assistant", content: fullText });
     } else {
-      addMessage("assistant", "No text output returned.", "grid");
+      appendToMessage(messageWrapper, "No text output returned.");
     }
   } catch (error) {
-    addMessage("assistant", error.message, "error");
+    if (messageWrapper) {
+      appendToMessage(messageWrapper, `\n\nError: ${error.message}`);
+    } else {
+      addMessage("assistant", error.message, "error");
+    }
     if (error.message.includes("tokenizer")) {
       tokenizerNote.textContent =
         "Tokenizer missing. Set coordinator.tokenizer_path to enable text inference.";

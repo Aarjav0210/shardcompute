@@ -121,6 +121,7 @@ class CoordinatorServer:
         # Inference
         self.app.router.add_post("/api/inference", self._handle_inference)
         self.app.router.add_post("/api/inference/text", self._handle_inference_text)
+        self.app.router.add_post("/api/inference/text/stream", self._handle_inference_text_stream)
         self.app.router.add_get("/api/inference/poll", self._handle_poll)
         self.app.router.add_post("/api/inference/response", self._handle_response)
         self.app.router.add_get("/api/inference/{request_id}", self._handle_get_result)
@@ -323,7 +324,78 @@ class CoordinatorServer:
         except Exception as e:
             logger.error(f"Text inference error: {e}")
             return web.json_response({"error": str(e)}, status=500)
-    
+
+    async def _handle_inference_text_stream(self, request: web.Request) -> web.StreamResponse:
+        """Handle streaming text inference request from UI clients using SSE."""
+        response = web.StreamResponse(
+            status=200,
+            reason="OK",
+            headers={
+                "Content-Type": "text/event-stream",
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+            },
+        )
+        await response.prepare(request)
+
+        try:
+            data = await request.json()
+            prompt = str(data.get("prompt", "")).strip()
+            messages = data.get("messages")
+            if not prompt and not messages:
+                await response.write(b"event: error\ndata: {\"error\": \"Prompt or messages required\"}\n\n")
+                await response.write_eof()
+                return response
+
+            input_ids = self._encode_prompt(prompt, messages)
+            input_length = len(input_ids)
+
+            inference_response = await self._run_inference(
+                input_ids=input_ids,
+                max_new_tokens=data.get("max_new_tokens", 120),
+                temperature=data.get("temperature", 0.7),
+                top_p=data.get("top_p", 0.9),
+                stop_tokens=data.get("stop_tokens", self._default_stop_tokens()),
+                timeout=data.get("timeout", 300),
+            )
+
+            output_ids = inference_response.output_ids
+            generated_ids = output_ids[input_length:] if len(output_ids) > input_length else output_ids
+            output_text = self._decode_output(generated_ids)
+
+            # Stream tokens character by character for smooth display
+            # In the future, this can be replaced with actual token-by-token streaming from workers
+            import json
+            words = output_text.split()
+            for i, word in enumerate(words):
+                token_text = word if i == 0 else f" {word}"
+                event_data = json.dumps({"token": token_text})
+                await response.write(f"event: token\ndata: {event_data}\n\n".encode("utf-8"))
+                await asyncio.sleep(0.02)  # Small delay for visual effect
+
+            # Send completion event
+            completion_data = json.dumps({
+                "request_id": inference_response.request_id,
+                "timing": inference_response.timing,
+            })
+            await response.write(f"event: done\ndata: {completion_data}\n\n".encode("utf-8"))
+            await response.write_eof()
+            return response
+
+        except InferenceError as e:
+            import json
+            error_data = json.dumps({"error": str(e)})
+            await response.write(f"event: error\ndata: {error_data}\n\n".encode("utf-8"))
+            await response.write_eof()
+            return response
+        except Exception as e:
+            logger.error(f"Streaming text inference error: {e}")
+            import json
+            error_data = json.dumps({"error": str(e)})
+            await response.write(f"event: error\ndata: {error_data}\n\n".encode("utf-8"))
+            await response.write_eof()
+            return response
+
     async def _handle_poll(self, request: web.Request) -> web.Response:
         """Handle worker polling for inference requests."""
         try:
@@ -394,11 +466,12 @@ class CoordinatorServer:
     
     async def _handle_status(self, request: web.Request) -> web.Response:
         """Handle status request."""
+        health_status = self.health_monitor.get_health_status()
         return web.json_response({
             "status": "running" if self._running else "stopped",
             "cluster_ready": self.registry.is_cluster_ready,
             "cluster_healthy": self.health_monitor.is_cluster_healthy(),
-            "workers": self.registry.worker_count,
+            "workers": health_status["healthy_count"],
             "expected_workers": self.registry.config.expected_workers,
         })
     

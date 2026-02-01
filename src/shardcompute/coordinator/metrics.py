@@ -66,32 +66,35 @@ class ClusterMetrics:
 class MetricsAggregator:
     """
     Aggregates metrics from workers and inference requests.
-    
+
     Responsibilities:
     - Collect metrics from worker heartbeats
     - Track inference request metrics
     - Compute aggregate statistics
     - Maintain rolling window for recent stats
     """
-    
+
     def __init__(self, window_size: int = 100):
         """
         Initialize MetricsAggregator.
-        
+
         Args:
             window_size: Number of recent requests to keep for statistics
         """
         self.window_size = window_size
-        
+
         # Cluster-level metrics
         self.cluster = ClusterMetrics()
-        
+
         # Per-worker metrics
         self.worker_metrics: Dict[int, Dict[str, Any]] = {}
-        
+
         # Recent requests (rolling window)
         self._recent_requests: deque = deque(maxlen=window_size)
-        
+
+        # Track last request throughput
+        self._last_throughput: float = 0.0
+
         # Timing
         self._start_time = time.time()
     
@@ -142,7 +145,10 @@ class MetricsAggregator:
         self._recent_requests.append(metrics)
         self.cluster.recent_latencies = [r.total_time_ms for r in self._recent_requests]
         self.cluster.recent_throughputs = [r.tokens_per_second for r in self._recent_requests]
-        
+
+        # Store last request throughput
+        self._last_throughput = tokens_per_second
+
         logger.debug(
             f"Recorded inference metrics: {request_id}, "
             f"{total_time:.1f}ms, {tokens_per_second:.1f} tok/s"
@@ -164,7 +170,7 @@ class MetricsAggregator:
     def get_summary(self) -> Dict[str, Any]:
         """Get summary of all metrics."""
         uptime = time.time() - self._start_time
-        
+
         return {
             "uptime_seconds": uptime,
             "total_requests": self.cluster.total_requests,
@@ -172,6 +178,7 @@ class MetricsAggregator:
             "avg_latency_ms": self.cluster.avg_latency_ms,
             "p99_latency_ms": self.cluster.p99_latency_ms,
             "avg_throughput_tokens_per_sec": self.cluster.avg_throughput,
+            "last_throughput_tokens_per_sec": self._last_throughput,
             "compute_fraction": self.cluster.compute_fraction,
             "requests_per_second": (
                 self.cluster.total_requests / uptime if uptime > 0 else 0
