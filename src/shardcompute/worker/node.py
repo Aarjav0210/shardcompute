@@ -518,9 +518,18 @@ class WorkerNode:
         """Send a streaming token to coordinator."""
         url = f"{self.coordinator_url}/api/inference/stream/token"
 
-        async with self._http_session.post(url, json=token.to_dict()) as resp:
-            if resp.status != 200:
-                logger.error(f"Failed to send streaming token: {await resp.text()}")
+        try:
+            async with self._http_session.post(
+                url,
+                json=token.to_dict(),
+                timeout=aiohttp.ClientTimeout(total=2.0)  # Short timeout to avoid blocking
+            ) as resp:
+                if resp.status != 200:
+                    logger.warning(f"Failed to send streaming token: {await resp.text()}")
+        except asyncio.TimeoutError:
+            logger.warning(f"Timeout sending streaming token for request {token.request_id}")
+        except Exception as e:
+            logger.warning(f"Error sending streaming token: {e}")
     
     async def stop(self):
         """Stop the worker node."""

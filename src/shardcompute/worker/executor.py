@@ -253,6 +253,9 @@ class ParallelExecutor:
         if stop_tokens is None:
             stop_tokens = []
 
+        # Track total generation time
+        generation_start = time.perf_counter()
+
         # Reset cache
         self._past_key_values = None
 
@@ -320,6 +323,19 @@ class ParallelExecutor:
             # Forward with cache
             next_input = next_token[:, None]  # [batch, 1]
             logits = await self.forward(next_input, use_cache=True)
+
+        # Calculate total generation time
+        generation_time = (time.perf_counter() - generation_start) * 1000  # ms
+
+        # Update last_metrics with generation summary
+        num_generated = len(generated)
+        if num_generated > 0:
+            self.last_metrics = ExecutionMetrics(
+                total_time_ms=generation_time,
+                layer_timings=[],
+                input_tokens=num_generated,  # For metrics, this represents tokens generated
+                output_shape=[1, num_generated],
+            )
 
         # Concatenate generated tokens
         if generated:

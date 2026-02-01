@@ -94,6 +94,9 @@ class CoordinatorServer:
 
         # Streaming token queues (one per streaming request)
         self._streaming_queues: Dict[str, asyncio.Queue] = {}
+
+        # Track input lengths for metric calculation
+        self._request_input_lengths: Dict[str, int] = {}
         
         # HTTP app
         self.app = web.Application()
@@ -381,6 +384,7 @@ class CoordinatorServer:
             # Create streaming queue and events for this request
             self._streaming_queues[request_id] = asyncio.Queue()
             self._request_events[request_id] = asyncio.Event()
+            self._request_input_lengths[request_id] = len(input_ids)  # Track input length
 
             # Queue the request
             await self._pending_requests.put(inference_request)
@@ -448,6 +452,7 @@ class CoordinatorServer:
                 self._streaming_queues.pop(request_id, None)
                 self._request_events.pop(request_id, None)
                 self._completed_requests.pop(request_id, None)
+                self._request_input_lengths.pop(request_id, None)
 
     async def _handle_poll(self, request: web.Request) -> web.Response:
         """Handle worker polling for inference requests."""
@@ -478,12 +483,20 @@ class CoordinatorServer:
 
             # Record metrics
             if response.timing and not response.error:
+                # Calculate actual generated tokens
+                input_length = self._request_input_lengths.get(request_id, 0)
+                total_tokens = len(response.output_ids)
+                generated_tokens = total_tokens - input_length if total_tokens > input_length else total_tokens
+
                 self.metrics.record_inference(
                     request_id=request_id,
                     timing=response.timing,
-                    input_tokens=len(response.output_ids) // 2,  # Approximate
-                    output_tokens=len(response.output_ids),
+                    input_tokens=input_length,
+                    output_tokens=generated_tokens,
                 )
+
+                # Clean up input length tracking
+                self._request_input_lengths.pop(request_id, None)
 
             # Store response and signal
             self._completed_requests[request_id] = response
@@ -673,6 +686,7 @@ class CoordinatorServer:
         )
 
         self._request_events[request_id] = asyncio.Event()
+        self._request_input_lengths[request_id] = len(input_ids)  # Track input length
         await self._pending_requests.put(inference_request)
         logger.info(f"Inference request queued: {request_id}")
 
@@ -683,10 +697,12 @@ class CoordinatorServer:
             )
         except asyncio.TimeoutError as e:
             self._request_events.pop(request_id, None)
+            self._request_input_lengths.pop(request_id, None)
             raise InferenceError("Inference timeout", 504) from e
 
         response = self._completed_requests.pop(request_id, None)
         self._request_events.pop(request_id, None)
+        self._request_input_lengths.pop(request_id, None)
 
         if response is None:
             raise InferenceError("Response not found", 500)
