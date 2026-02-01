@@ -471,6 +471,26 @@ class PipelineWeightSharder:
         """Check if weight is the LM head."""
         return name.startswith("lm_head")
 
+    def _is_quantized_weight(self, name: str, weights: Dict[str, np.ndarray]) -> bool:
+        """Check if a weight has quantization components (scales and biases)."""
+        if not name.endswith(".weight"):
+            return False
+        base_name = name.rsplit(".weight", 1)[0]
+        scales_key = f"{base_name}.scales"
+        biases_key = f"{base_name}.biases"
+        return scales_key in weights and biases_key in weights
+
+    def _is_linear_weight(self, name: str) -> bool:
+        """Check if a weight is a linear layer (not norm/embedding)."""
+        if any(x in name for x in ["layernorm", "layer_norm", "norm", "ln"]):
+            return False
+        # Linear layers: projections, lm_head, etc.
+        return any(x in name for x in [
+            "q_proj", "k_proj", "v_proj", "o_proj", "dense",
+            "gate_proj", "up_proj", "down_proj", "fc1", "fc2",
+            "lm_head"
+        ])
+
     def shard_weights(
         self,
         weights: Dict[str, np.ndarray],
@@ -483,6 +503,9 @@ class PipelineWeightSharder:
         the full weight tensors for its assigned layers. Linear weights are
         transposed from HuggingFace [out, in] to MLX [in, out] format.
 
+        For quantized weights (with .scales and .biases), all three components
+        are transposed together to match MLX's quantization format.
+
         Args:
             weights: Full model weights dict
             rank: Pipeline stage rank
@@ -494,12 +517,29 @@ class PipelineWeightSharder:
         is_first_stage = rank == 0
         is_last_stage = rank == self.world_size - 1
         sharded = {}
+        processed = set()  # Track processed quantized components
 
         for name, weight in weights.items():
+            # Skip if already processed as part of quantized weight group
+            if name in processed:
+                continue
+
             # Embedding → first stage only
             if self._is_embedding_weight(name):
                 if is_first_stage:
-                    sharded[name] = weight.copy()
+                    # Check for quantized embedding
+                    if self._is_quantized_weight(name, weights):
+                        base_name = name.rsplit(".weight", 1)[0]
+                        scales_key = f"{base_name}.scales"
+                        biases_key = f"{base_name}.biases"
+                        # Embeddings are not transposed (vocab_size, hidden_size) stays as-is
+                        sharded[name] = weight.copy()
+                        sharded[scales_key] = weights[scales_key].copy()
+                        sharded[biases_key] = weights[biases_key].copy()
+                        processed.add(scales_key)
+                        processed.add(biases_key)
+                    else:
+                        sharded[name] = weight.copy()
                 continue
 
             # Final norm → last stage only
@@ -511,24 +551,62 @@ class PipelineWeightSharder:
             # LM head → last stage only
             if self._is_lm_head_weight(name):
                 if is_last_stage:
-                    # Transpose lm_head to MLX format [in, out]
-                    if len(weight.shape) == 2:
-                        sharded[name] = weight.T.copy()
+                    # Check for quantized lm_head
+                    if self._is_quantized_weight(name, weights):
+                        base_name = name.rsplit(".weight", 1)[0]
+                        scales_key = f"{base_name}.scales"
+                        biases_key = f"{base_name}.biases"
+                        # Transpose quantized lm_head components
+                        if len(weight.shape) == 2:
+                            sharded[name] = weight.T.copy()
+                            sharded[scales_key] = weights[scales_key].T.copy()
+                            sharded[biases_key] = weights[biases_key].T.copy()
+                        else:
+                            sharded[name] = weight.copy()
+                            sharded[scales_key] = weights[scales_key].copy()
+                            sharded[biases_key] = weights[biases_key].copy()
+                        processed.add(scales_key)
+                        processed.add(biases_key)
                     else:
-                        sharded[name] = weight.copy()
+                        # Transpose standard lm_head to MLX format [in, out]
+                        if len(weight.shape) == 2:
+                            sharded[name] = weight.T.copy()
+                        else:
+                            sharded[name] = weight.copy()
                 continue
 
             # Transformer layer weights
             if self._is_layer_weight(name):
                 layer_idx = self._get_layer_index(name)
                 if start_layer <= layer_idx < end_layer:
-                    # Transpose 2D linear weights to MLX format
-                    if len(weight.shape) == 2 and not any(
-                        x in name for x in ["layernorm", "layer_norm", "norm", "ln"]
-                    ):
-                        sharded[name] = weight.T.copy()
+                    # Check for quantized weight
+                    if self._is_quantized_weight(name, weights):
+                        base_name = name.rsplit(".weight", 1)[0]
+                        scales_key = f"{base_name}.scales"
+                        biases_key = f"{base_name}.biases"
+
+                        # Transpose quantized linear weights to MLX format
+                        if self._is_linear_weight(name) and len(weight.shape) == 2:
+                            sharded[name] = weight.T.copy()
+                            # Transpose scales and biases as well
+                            sharded[scales_key] = weights[scales_key].T.copy()
+                            sharded[biases_key] = weights[biases_key].T.copy()
+                        else:
+                            # Non-linear or 1D weights (layer norms, biases)
+                            sharded[name] = weight.copy()
+                            sharded[scales_key] = weights[scales_key].copy()
+                            sharded[biases_key] = weights[biases_key].copy()
+                        processed.add(scales_key)
+                        processed.add(biases_key)
                     else:
-                        sharded[name] = weight.copy()
+                        # Standard (non-quantized) weights
+                        # Transpose 2D linear weights to MLX format
+                        if len(weight.shape) == 2 and not any(
+                            x in name for x in ["layernorm", "layer_norm", "norm", "ln"]
+                        ):
+                            sharded[name] = weight.T.copy()
+                        else:
+                            sharded[name] = weight.copy()
                 continue
 
             # Unknown weight — replicate to all stages
