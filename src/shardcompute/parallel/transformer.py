@@ -129,6 +129,7 @@ class ParallelTransformerBlock:
         self.hidden_size = hidden_size
         self.world_size = world_size
         self.rank = rank
+        self.communicator = communicator
         self.use_quantized = use_quantized
 
         # Input layernorm (before attention)
