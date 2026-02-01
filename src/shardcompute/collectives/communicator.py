@@ -95,10 +95,14 @@ class Communicator:
         
         # Stats
         self.stats = CommunicatorStats()
-        
+
         # State
         self._initialized = False
         self._barrier_counter = 0
+
+        # Async all-reduce tracking
+        self._pending_all_reduces: Dict[str, asyncio.Task] = {}
+        self._all_reduce_counter = 0
     
     @property
     def is_initialized(self) -> bool:
@@ -283,7 +287,69 @@ class Communicator:
         self.stats.total_bytes_received += self._all_reduce.last_bytes_transferred // 2
         
         return result
-    
+
+    def start_all_reduce(
+        self,
+        tensor: mx.array,
+        op: str = "sum",
+    ) -> str:
+        """
+        Start a non-blocking all-reduce and return an operation ID.
+
+        Use wait_all_reduce() to retrieve the result. This allows overlapping
+        communication with computation.
+
+        Args:
+            tensor: Local tensor to reduce
+            op: Reduction operation ('sum', 'mean', 'max', 'min')
+
+        Returns:
+            Operation ID to pass to wait_all_reduce()
+        """
+        if not self._initialized:
+            raise RuntimeError("Communicator not initialized")
+
+        # Evaluate tensor before starting async operation
+        mx.eval(tensor)
+
+        self._all_reduce_counter += 1
+        op_id = f"ar_{self.rank}_{self._all_reduce_counter}"
+
+        async def _do_all_reduce():
+            start_time = time.perf_counter()
+            result = await self._all_reduce.all_reduce(tensor, op)
+            elapsed = (time.perf_counter() - start_time) * 1000
+            return result, elapsed
+
+        task = asyncio.create_task(_do_all_reduce())
+        self._pending_all_reduces[op_id] = task
+
+        return op_id
+
+    async def wait_all_reduce(self, op_id: str) -> mx.array:
+        """
+        Wait for a non-blocking all-reduce to complete and return the result.
+
+        Args:
+            op_id: Operation ID from start_all_reduce()
+
+        Returns:
+            Reduced tensor (identical on all workers)
+        """
+        if op_id not in self._pending_all_reduces:
+            raise ValueError(f"Unknown all-reduce operation ID: {op_id}")
+
+        task = self._pending_all_reduces.pop(op_id)
+        result, elapsed = await task
+
+        # Update stats
+        self.stats.total_all_reduce_calls += 1
+        self.stats.total_all_reduce_time_ms += elapsed
+        self.stats.total_bytes_sent += self._all_reduce.last_bytes_transferred // 2
+        self.stats.total_bytes_received += self._all_reduce.last_bytes_transferred // 2
+
+        return result
+
     async def all_gather(
         self,
         tensor: mx.array,
