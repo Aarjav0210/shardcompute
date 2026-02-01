@@ -452,8 +452,9 @@ class PipelineModelLoader:
 
         weights = self._load_safetensors(rank_dir / "model.safetensors")
 
-        # Load embedding (first stage only)
-        if model.has_embedding:
+        # Load embedding (first stage, OR last stage if tied embeddings for lm_head)
+        # model.embed_tokens will be non-None on last stage if tie_word_embeddings=True
+        if model.embed_tokens is not None:
             self._load_embedding(model, weights)
 
         # Load transformer layers

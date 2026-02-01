@@ -1002,8 +1002,11 @@ class PipelineParallelTransformer:
         self.has_embedding = rank == 0
         self.has_lm_head = rank == world_size - 1
 
-        # Embedding (first stage only)
+        # Embedding (first stage only, OR last stage if tied embeddings for lm_head)
         if self.has_embedding:
+            self.embed_tokens = Embedding(vocab_size, hidden_size)
+        elif self.has_lm_head and tie_word_embeddings:
+            # Last stage needs embedding weights for tied lm_head computation
             self.embed_tokens = Embedding(vocab_size, hidden_size)
         else:
             self.embed_tokens = None
@@ -1067,8 +1070,8 @@ class PipelineParallelTransformer:
         Returns:
             (output, cache) where output is hidden_states or logits
         """
-        # Embedding (first stage)
-        if self.has_embedding:
+        # Embedding (first stage only - even if last stage has embed_tokens for tied lm_head)
+        if self.has_embedding and self.rank == 0:
             if input_ids is None:
                 raise ValueError("First stage requires input_ids")
             hidden_states = self.embed_tokens.forward(input_ids)

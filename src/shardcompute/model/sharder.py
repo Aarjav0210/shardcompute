@@ -495,6 +495,7 @@ class PipelineWeightSharder:
         self,
         weights: Dict[str, np.ndarray],
         rank: int,
+        tie_word_embeddings: bool = False,
     ) -> Dict[str, np.ndarray]:
         """
         Select weights for a pipeline stage (rank).
@@ -509,6 +510,8 @@ class PipelineWeightSharder:
         Args:
             weights: Full model weights dict
             rank: Pipeline stage rank
+            tie_word_embeddings: If True, embedding weights are also included
+                on the last stage (for lm_head computation with tied embeddings)
 
         Returns:
             Dict of weights belonging to this rank (full, not split)
@@ -524,9 +527,10 @@ class PipelineWeightSharder:
             if name in processed:
                 continue
 
-            # Embedding → first stage only
+            # Embedding → first stage, AND last stage if tie_word_embeddings
             if self._is_embedding_weight(name):
-                if is_first_stage:
+                include_embedding = is_first_stage or (is_last_stage and tie_word_embeddings)
+                if include_embedding:
                     # Check for quantized embedding
                     if self._is_quantized_weight(name, weights):
                         base_name = name.rsplit(".weight", 1)[0]
@@ -637,11 +641,14 @@ class PipelineWeightSharder:
         with open(output_path / "config.json", "w") as f:
             json.dump(config_data, f, indent=2)
 
+        # Check if model uses tied embeddings
+        tie_word_embeddings = getattr(self.model_config, 'tie_word_embeddings', False)
+
         for rank in range(self.world_size):
             rank_dir = output_path / f"rank_{rank}"
             rank_dir.mkdir(exist_ok=True)
 
-            sharded = self.shard_weights(weights, rank)
+            sharded = self.shard_weights(weights, rank, tie_word_embeddings=tie_word_embeddings)
 
             save_safetensors(sharded, str(rank_dir / "model.safetensors"))
 
