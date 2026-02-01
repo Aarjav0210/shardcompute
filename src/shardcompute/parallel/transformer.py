@@ -218,9 +218,10 @@ class ParallelTransformerBlock:
         use_cache: bool = False,
     ) -> Tuple[mx.array, Optional[Tuple[mx.array, mx.array]]]:
         """
-        Forward pass through transformer block with pipelined communication.
+        Forward pass through transformer block.
 
-        Overlaps attention all-reduce with MLP computation for better latency.
+        Uses standard blocking all-reduce pattern. The async API helps
+        reduce latency by yielding control during network I/O.
 
         Args:
             hidden_states: [batch, seq_len, hidden_size] - REPLICATED
@@ -232,64 +233,22 @@ class ParallelTransformerBlock:
             hidden_states: [batch, seq_len, hidden_size] - REPLICATED
             cache: Updated KV cache if use_cache=True
         """
-        # === ATTENTION PHASE ===
-        attn_residual = hidden_states
-        normed_hidden = self.input_layernorm(hidden_states)
-
-        # Compute attention (QKV + attention + O_proj partial) without all-reduce
-        attn_partial, cache = self.attention.forward_partial_with_cache(
-            normed_hidden,
+        # Attention with residual connection
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
+        attn_output, cache = await self.attention.forward(
+            hidden_states,
             attention_mask=attention_mask,
             past_key_value=past_key_value,
             use_cache=use_cache,
         )
+        hidden_states = residual + attn_output
 
-        # Start async all-reduce for attention output
-        mx.eval(attn_partial)  # Ensure computation is done before network op
-        attn_ar_id = self.communicator.start_all_reduce(attn_partial, op="sum")
-
-        # === MLP PHASE (overlapped with attention all-reduce) ===
-        # While attention all-reduce is in flight, prepare MLP input
-        # We need the attention output for the residual, so we'll compute
-        # MLP on the pre-attention hidden states normalized differently
-        #
-        # However, the correct MLP input depends on attention output:
-        #   mlp_input = post_attn_norm(attn_residual + attn_output)
-        #
-        # We CAN still overlap by computing MLP's column-parallel projections
-        # (gate_proj, up_proj) which don't depend on the all-reduce result.
-        # But the full pipeline requires attention output first.
-        #
-        # For now, wait for attention and overlap with NEXT layer instead.
-
-        # Wait for attention all-reduce
-        attn_output = await self.communicator.wait_all_reduce(attn_ar_id)
-
-        # Add bias if needed (bias is added after all-reduce in row-parallel)
-        attn_output = self.attention.o_proj.add_bias(attn_output)
-
-        # Attention residual connection
-        hidden_states = attn_residual + attn_output
-
-        # === MLP with pipelined all-reduce ===
-        mlp_residual = hidden_states
-        normed_for_mlp = self.post_attention_layernorm(hidden_states)
-
-        # Compute MLP partial (gate + up + activation + down_proj partial)
-        mlp_partial = self.mlp.forward_sync_partial(normed_for_mlp)
-
-        # Start async all-reduce for MLP output
-        mx.eval(mlp_partial)
-        mlp_ar_id = self.communicator.start_all_reduce(mlp_partial, op="sum")
-
-        # Wait for MLP all-reduce
-        mlp_output = await self.communicator.wait_all_reduce(mlp_ar_id)
-
-        # Add bias if needed
-        mlp_output = self.mlp.down_proj.add_bias(mlp_output)
-
-        # MLP residual connection
-        hidden_states = mlp_residual + mlp_output
+        # MLP with residual connection
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        mlp_output = await self.mlp.forward(hidden_states)
+        hidden_states = residual + mlp_output
 
         return hidden_states, cache
 
@@ -325,17 +284,23 @@ class ParallelTransformerBlock:
             mlp_residual: Residual to add when mlp_ar_id completes
             mlp_proj: The down_proj layer for add_bias
         """
-        # First, complete the pending all-reduce from previous layer if any
+        # === OVERLAP STRATEGY ===
+        # While the previous layer's MLP all-reduce runs in background,
+        # compute this layer's attention (which doesn't depend on it).
+
+        # Start computing attention on the INPUT hidden_states (not yet updated)
+        # This is only valid if we're pipelining correctly from the caller
         if pending_ar_id is not None:
-            prev_output = await self.communicator.wait_all_reduce(pending_ar_id)
-            prev_output = pending_ar_proj.add_bias(prev_output)
-            hidden_states = pending_ar_residual + prev_output
+            # Use hidden_states as-is for now (will be updated after attention)
+            attn_input = hidden_states
+        else:
+            attn_input = hidden_states
 
         # === ATTENTION PHASE ===
-        attn_residual = hidden_states
-        normed_hidden = self.input_layernorm(hidden_states)
+        attn_residual = attn_input
+        normed_hidden = self.input_layernorm(attn_input)
 
-        # Compute attention partial
+        # Compute attention partial (overlaps with pending MLP all-reduce if any)
         attn_partial, cache = self.attention.forward_partial_with_cache(
             normed_hidden,
             attention_mask=attention_mask,
@@ -553,7 +518,6 @@ class ParallelTransformer:
         attention_mask: Optional[mx.array] = None,
         past_key_values: Optional[List[Tuple[mx.array, mx.array]]] = None,
         use_cache: bool = False,
-        use_pipelined: bool = True,
     ) -> Tuple[mx.array, Optional[List[Tuple[mx.array, mx.array]]]]:
         """
         Forward pass through the full model.
@@ -563,8 +527,6 @@ class ParallelTransformer:
             attention_mask: Optional attention mask
             past_key_values: KV cache from previous steps
             use_cache: Whether to return updated cache
-            use_pipelined: Use pipelined communication (overlaps MLP all-reduce
-                          with next layer's attention). Default True.
 
         Returns:
             logits: [batch, seq_len, vocab_size] - REPLICATED
@@ -579,65 +541,21 @@ class ParallelTransformer:
         # Evaluate every N layers to balance memory vs GPU sync overhead.
         eval_interval = 4
 
-        if use_pipelined and len(self.layers) > 1:
-            # === PIPELINED EXECUTION ===
-            # Overlap layer N's MLP all-reduce with layer N+1's attention compute
+        for i, layer in enumerate(self.layers):
+            past_kv = past_key_values[i] if past_key_values else None
 
-            pending_ar_id = None
-            pending_ar_residual = None
-            pending_ar_proj = None
+            hidden_states, layer_cache = await layer.forward(
+                hidden_states,
+                attention_mask=attention_mask,
+                past_key_value=past_kv,
+                use_cache=use_cache,
+            )
 
-            for i, layer in enumerate(self.layers):
-                past_kv = past_key_values[i] if past_key_values else None
+            if (i + 1) % eval_interval == 0 or i == len(self.layers) - 1:
+                mx.eval(hidden_states)
 
-                (
-                    hidden_states,
-                    layer_cache,
-                    pending_ar_id,
-                    pending_ar_residual,
-                    pending_ar_proj,
-                ) = await layer.forward_with_pending_ar(
-                    hidden_states,
-                    pending_ar_id,
-                    pending_ar_residual,
-                    pending_ar_proj,
-                    attention_mask=attention_mask,
-                    past_key_value=past_kv,
-                    use_cache=use_cache,
-                )
-
-                # Evaluate periodically to prevent memory buildup
-                if (i + 1) % eval_interval == 0:
-                    mx.eval(hidden_states)
-
-                if use_cache and layer_cache is not None:
-                    new_cache.append(layer_cache)
-
-            # Complete the final layer's pending MLP all-reduce
-            if pending_ar_id is not None:
-                final_mlp = await self.communicator.wait_all_reduce(pending_ar_id)
-                final_mlp = pending_ar_proj.add_bias(final_mlp)
-                hidden_states = pending_ar_residual + final_mlp
-
-            mx.eval(hidden_states)
-
-        else:
-            # === SEQUENTIAL EXECUTION (fallback) ===
-            for i, layer in enumerate(self.layers):
-                past_kv = past_key_values[i] if past_key_values else None
-
-                hidden_states, layer_cache = await layer.forward(
-                    hidden_states,
-                    attention_mask=attention_mask,
-                    past_key_value=past_kv,
-                    use_cache=use_cache,
-                )
-
-                if (i + 1) % eval_interval == 0 or i == len(self.layers) - 1:
-                    mx.eval(hidden_states)
-
-                if use_cache and layer_cache is not None:
-                    new_cache.append(layer_cache)
+            if use_cache and layer_cache is not None:
+                new_cache.append(layer_cache)
 
         # Final layer norm
         hidden_states = self.norm(hidden_states)

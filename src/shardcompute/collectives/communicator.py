@@ -350,6 +350,73 @@ class Communicator:
 
         return result
 
+    async def all_reduce_batch(
+        self,
+        tensors: List[mx.array],
+        op: str = "sum",
+    ) -> List[mx.array]:
+        """
+        Perform batched all-reduce on multiple tensors.
+
+        Concatenates tensors, performs single all-reduce, then splits result.
+        This reduces the number of network round-trips at the cost of sending
+        a larger message.
+
+        Args:
+            tensors: List of tensors to reduce (must all have same dtype)
+            op: Reduction operation
+
+        Returns:
+            List of reduced tensors (same order as input)
+        """
+        if not self._initialized:
+            raise RuntimeError("Communicator not initialized")
+
+        if len(tensors) == 0:
+            return []
+        if len(tensors) == 1:
+            return [await self.all_reduce(tensors[0], op)]
+
+        start_time = time.perf_counter()
+
+        # Flatten and concatenate all tensors
+        flattened = []
+        shapes = []
+        sizes = []
+        dtype = tensors[0].dtype
+
+        for tensor in tensors:
+            if tensor.dtype != dtype:
+                raise ValueError("All tensors must have same dtype for batched all-reduce")
+            flat = tensor.reshape(-1)
+            flattened.append(flat)
+            shapes.append(tensor.shape)
+            sizes.append(flat.size)
+
+        # Concatenate into single tensor
+        combined = mx.concatenate(flattened, axis=0)
+
+        # Single all-reduce
+        reduced = await self._all_reduce.all_reduce(combined, op)
+
+        # Split back into original tensors
+        results = []
+        offset = 0
+        for i, (shape, size) in enumerate(zip(shapes, sizes)):
+            result = reduced[offset:offset + size].reshape(shape)
+            results.append(result)
+            offset += size
+
+        elapsed = (time.perf_counter() - start_time) * 1000
+
+        # Update stats (count as 1 all-reduce with combined size)
+        self.stats.total_all_reduce_calls += 1
+        self.stats.total_all_reduce_time_ms += elapsed
+        self.stats.total_bytes_sent += self._all_reduce.last_bytes_transferred // 2
+        self.stats.total_bytes_received += self._all_reduce.last_bytes_transferred // 2
+
+        return results
+
     async def all_gather(
         self,
         tensor: mx.array,

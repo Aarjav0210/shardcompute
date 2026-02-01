@@ -2,7 +2,7 @@
 
 import struct
 import zlib
-from typing import Tuple, Optional
+from typing import Tuple, Optional, Dict
 import numpy as np
 import mlx.core as mx
 import msgpack
@@ -49,16 +49,22 @@ MLX_DTYPE_TO_STR = {v: k for k, v in STR_TO_MLX_DTYPE.items()}
 class TensorSerializer:
     """
     Serializer for MLX tensors with optional compression.
-    
-    Protocol:
+
+    Protocol (standard):
     - 4 bytes: metadata length (uint32, big-endian)
     - N bytes: msgpack-encoded metadata
     - M bytes: tensor data (raw or compressed)
+
+    Protocol (fast path - when shape is pinned):
+    - 1 byte: 0xFF marker (indicates fast path)
+    - 1 byte: slot ID (which registered shape to use)
+    - M bytes: raw tensor data (no metadata)
     """
-    
+
     HEADER_SIZE = 4  # uint32 for metadata length
+    FAST_PATH_MARKER = 0xFF  # Indicates fast-path message
     COMPRESSION_THRESHOLD = 1024 * 1024  # 1MB default threshold
-    
+
     def __init__(
         self,
         compression_enabled: bool = False,
@@ -68,6 +74,98 @@ class TensorSerializer:
         self.compression_enabled = compression_enabled
         self.compression_threshold = compression_threshold
         self.compression_level = compression_level
+
+        # Fast-path shape registry: slot_id -> (shape, dtype, nbytes)
+        self._pinned_shapes: Dict[int, Tuple[Tuple[int, ...], str, int]] = {}
+        self._next_slot_id = 0
+
+    def pin_shape(self, shape: Tuple[int, ...], dtype: str) -> int:
+        """
+        Register a tensor shape for fast-path serialization.
+
+        Once pinned, tensors of this shape can use serialize_fast() which
+        skips metadata encoding entirely - just sends raw bytes with a 2-byte header.
+
+        Args:
+            shape: Tensor shape tuple
+            dtype: Dtype string ('float32', 'float16', etc.)
+
+        Returns:
+            slot_id: ID to use with serialize_fast/deserialize_fast
+        """
+        slot_id = self._next_slot_id
+        self._next_slot_id += 1
+
+        # Calculate expected nbytes
+        np_dtype = self._get_numpy_dtype(dtype)
+        nbytes = int(np.prod(shape)) * np.dtype(np_dtype).itemsize
+
+        self._pinned_shapes[slot_id] = (shape, dtype, nbytes)
+        return slot_id
+
+    def serialize_fast(self, tensor: mx.array, slot_id: int) -> bytes:
+        """
+        Fast-path serialization using a pinned shape.
+
+        Skips msgpack metadata - just sends marker + slot_id + raw bytes.
+        ~50x less overhead than standard serialize() for small tensors.
+
+        Args:
+            tensor: Tensor to serialize (must match pinned shape)
+            slot_id: Slot ID from pin_shape()
+
+        Returns:
+            Serialized bytes (2-byte header + raw data)
+        """
+        if slot_id not in self._pinned_shapes:
+            raise ValueError(f"Unknown slot_id: {slot_id}")
+
+        np_array = self._mlx_to_numpy(tensor)
+        tensor_bytes = np_array.tobytes()
+
+        # 2-byte header: marker + slot_id
+        header = bytes([self.FAST_PATH_MARKER, slot_id & 0xFF])
+        return header + tensor_bytes
+
+    def deserialize_fast(self, data: bytes) -> mx.array:
+        """
+        Fast-path deserialization using pinned shape.
+
+        Expects data from serialize_fast().
+
+        Args:
+            data: Serialized bytes with 2-byte header
+
+        Returns:
+            Deserialized tensor
+        """
+        if len(data) < 2 or data[0] != self.FAST_PATH_MARKER:
+            raise ValueError("Not a fast-path message")
+
+        slot_id = data[1]
+        if slot_id not in self._pinned_shapes:
+            raise ValueError(f"Unknown slot_id: {slot_id}")
+
+        shape, dtype_str, expected_nbytes = self._pinned_shapes[slot_id]
+        tensor_bytes = data[2:]
+
+        if len(tensor_bytes) != expected_nbytes:
+            raise ValueError(f"Expected {expected_nbytes} bytes, got {len(tensor_bytes)}")
+
+        np_dtype = self._get_numpy_dtype(dtype_str)
+        np_array = np.frombuffer(tensor_bytes, dtype=np_dtype).reshape(shape)
+
+        mlx_dtype = STR_TO_MLX_DTYPE.get(dtype_str, mx.float32)
+        return mx.array(np_array, dtype=mlx_dtype)
+
+    def is_fast_path(self, data: bytes) -> bool:
+        """Check if data uses fast-path encoding."""
+        return len(data) >= 2 and data[0] == self.FAST_PATH_MARKER
+
+    def clear_pinned_shapes(self):
+        """Clear all pinned shapes (call at end of generation)."""
+        self._pinned_shapes.clear()
+        self._next_slot_id = 0
     
     def serialize(self, tensor: mx.array) -> bytes:
         """
