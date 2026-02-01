@@ -1,4 +1,4 @@
-"""Model loading utilities for tensor parallel inference."""
+"""Model loading utilities for tensor and pipeline parallel inference."""
 
 import logging
 from typing import Dict, Optional
@@ -11,6 +11,24 @@ from shardcompute.model.config import ModelConfig
 from shardcompute.parallel.transformer import ParallelTransformer
 
 logger = logging.getLogger(__name__)
+
+
+def detect_parallelism_mode(shard_dir: Path) -> str:
+    """
+    Detect which parallelism mode was used to create the shards.
+
+    Checks config.json in the shard directory for the 'mode' field.
+
+    Returns:
+        "tensor" or "pipeline"
+    """
+    config_path = shard_dir / "config.json"
+    if config_path.exists():
+        with open(config_path) as f:
+            data = json.load(f)
+        parallel = data.get("parallel", {})
+        return parallel.get("mode", "tensor")
+    return "tensor"
 
 
 class ModelLoader:
@@ -403,6 +421,224 @@ class ModelLoader:
                     gate_bias=mlp_weights.get("gate_bias"),
                 )
                 logger.debug(f"Loaded MLP weights for layer {layer_idx}")
+
+
+class PipelineModelLoader:
+    """
+    Loads pipeline-sharded weights into a PipelineParallelTransformer.
+
+    In pipeline mode each rank only has weights for its assigned layers.
+    Weights are already full (not split), and 2D linear weights are already
+    transposed to MLX [in, out] format by PipelineWeightSharder.
+    """
+
+    def __init__(self, rank: int, world_size: int, start_layer: int, end_layer: int):
+        self.rank = rank
+        self.world_size = world_size
+        self.start_layer = start_layer
+        self.end_layer = end_layer
+
+    async def load_shards(self, model, shard_dir: Path):
+        """
+        Load pipeline-sharded weights into a PipelineParallelTransformer.
+
+        Args:
+            model: PipelineParallelTransformer instance
+            shard_dir: Directory containing pre-sharded weights
+        """
+        rank_dir = shard_dir / f"rank_{self.rank}"
+        if not rank_dir.exists():
+            raise FileNotFoundError(f"Shard directory not found: {rank_dir}")
+
+        weights = self._load_safetensors(rank_dir / "model.safetensors")
+
+        # Load embedding (first stage, OR last stage if tied embeddings for lm_head)
+        # model.embed_tokens will be non-None on last stage if tie_word_embeddings=True
+        if model.embed_tokens is not None:
+            self._load_embedding(model, weights)
+
+        # Load transformer layers
+        self._load_layers(model, weights)
+
+        # Load final norm + lm_head (last stage only)
+        if model.has_lm_head:
+            self._load_norm(model, weights)
+            self._load_lm_head(model, weights)
+
+        logger.info(
+            f"Rank {self.rank} loaded pipeline model weights "
+            f"(layers {self.start_layer}-{self.end_layer - 1}) from {shard_dir}"
+        )
+
+    def _load_safetensors(self, path: Path) -> Dict[str, mx.array]:
+        weights = {}
+        with safe_open(str(path), framework="numpy") as f:
+            for key in f.keys():
+                weights[key] = mx.array(f.get_tensor(key))
+        return weights
+
+    def _load_embedding(self, model, weights: Dict[str, mx.array]):
+        for key in ["model.embed_tokens.weight", "embed_tokens.weight", "wte.weight"]:
+            if key in weights:
+                # Check for quantized embedding
+                base_key = key.rsplit(".weight", 1)[0]
+                scales_key = f"{base_key}.scales"
+                biases_key = f"{base_key}.biases"
+
+                if scales_key in weights and biases_key in weights:
+                    # Load quantized embedding
+                    model.embed_tokens.load_quantized_weights(
+                        weights[key],
+                        weights[scales_key],
+                        weights[biases_key],
+                    )
+                    logger.debug(f"Loaded quantized embedding: weight={weights[key].shape}, scales={weights[scales_key].shape}")
+                else:
+                    # Load standard embedding
+                    model.embed_tokens.weight = weights[key]
+                    logger.debug(f"Loaded embedding: {weights[key].shape}")
+                return
+
+    def _load_norm(self, model, weights: Dict[str, mx.array]):
+        for key in ["model.norm.weight", "model.final_layernorm.weight", "norm.weight", "ln_f.weight"]:
+            if key in weights:
+                bias_key = key.replace(".weight", ".bias")
+                model.norm.load_weights(weights[key], weights.get(bias_key))
+                logger.debug(f"Loaded final norm: {weights[key].shape}")
+                return
+
+    def _load_lm_head(self, model, weights: Dict[str, mx.array]):
+        if model.lm_head is None:
+            return
+        if "lm_head.weight" in weights:
+            weight = weights["lm_head.weight"]
+            bias = weights.get("lm_head.bias")
+
+            # Check for quantized weights
+            scales_key = "lm_head.scales"
+            biases_key = "lm_head.biases"
+
+            if scales_key in weights and biases_key in weights:
+                # Load quantized weights
+                model.lm_head.load_quantized_weights(
+                    weight,
+                    weights[scales_key],
+                    weights[biases_key],
+                )
+            else:
+                model.lm_head.weight = weight
+
+            if bias is not None:
+                model.lm_head.bias = bias
+            logger.debug(f"Loaded LM head: {weight.shape}")
+
+    def _load_layers(self, model, weights: Dict[str, mx.array]):
+        """Load weights for the layers assigned to this stage."""
+        for local_idx, layer in enumerate(model.layers):
+            global_idx = self.start_layer + local_idx
+            self._load_single_layer(global_idx, layer, weights)
+
+    def _load_single_layer(self, global_layer_idx: int, layer, weights: Dict[str, mx.array]):
+        """Load full (non-split) weights for a single transformer layer."""
+        prefix = f"model.layers.{global_layer_idx}"
+
+        # Layer norms
+        ln_key = f"{prefix}.input_layernorm.weight"
+        ln_bias_key = f"{prefix}.input_layernorm.bias"
+        if ln_key in weights:
+            layer.input_layernorm.load_weights(weights[ln_key], weights.get(ln_bias_key))
+
+        post_ln_key = f"{prefix}.post_attention_layernorm.weight"
+        post_ln_bias_key = f"{prefix}.post_attention_layernorm.bias"
+        if post_ln_key in weights:
+            layer.post_attention_layernorm.load_weights(
+                weights[post_ln_key], weights.get(post_ln_bias_key)
+            )
+        elif ln_key in weights:
+            layer.post_attention_layernorm.load_weights(
+                weights[ln_key], weights.get(ln_bias_key)
+            )
+
+        # Attention (full weights, already transposed)
+        for proj_name in ["q_proj", "k_proj", "v_proj", "o_proj"]:
+            w_key = f"{prefix}.self_attn.{proj_name}.weight"
+            b_key = f"{prefix}.self_attn.{proj_name}.bias"
+            if w_key not in weights and proj_name == "o_proj":
+                # Phi-2 naming
+                w_key = f"{prefix}.self_attn.dense.weight"
+                b_key = f"{prefix}.self_attn.dense.bias"
+            if w_key in weights:
+                proj = getattr(layer.attention, proj_name)
+
+                # Check for quantized weights
+                scales_key = w_key.replace(".weight", ".scales")
+                biases_key = w_key.replace(".weight", ".biases")
+
+                if scales_key in weights and biases_key in weights:
+                    # Load quantized weights
+                    proj.load_quantized_weights(
+                        weights[w_key],
+                        weights[scales_key],
+                        weights[biases_key],
+                    )
+                else:
+                    proj.weight = weights[w_key]
+
+                if b_key in weights:
+                    proj.bias = weights[b_key]
+
+        # MLP (full weights, already transposed)
+        gate_key = f"{prefix}.mlp.gate_proj.weight"
+        fc1_key = f"{prefix}.mlp.fc1.weight"
+
+        if gate_key in weights:
+            # Llama-style
+            for proj_name, hf_name in [("gate_proj", "gate_proj"), ("up_proj", "up_proj"), ("down_proj", "down_proj")]:
+                w_key = f"{prefix}.mlp.{hf_name}.weight"
+                b_key = f"{prefix}.mlp.{hf_name}.bias"
+                proj = getattr(layer.mlp, proj_name, None)
+                if proj is not None and w_key in weights:
+                    # Check for quantized weights
+                    scales_key = w_key.replace(".weight", ".scales")
+                    biases_key = w_key.replace(".weight", ".biases")
+
+                    if scales_key in weights and biases_key in weights:
+                        # Load quantized weights
+                        proj.load_quantized_weights(
+                            weights[w_key],
+                            weights[scales_key],
+                            weights[biases_key],
+                        )
+                    else:
+                        proj.weight = weights[w_key]
+
+                    if b_key in weights:
+                        proj.bias = weights[b_key]
+        elif fc1_key in weights:
+            # Phi-style
+            for proj_name, hf_name in [("up_proj", "fc1"), ("down_proj", "fc2")]:
+                w_key = f"{prefix}.mlp.{hf_name}.weight"
+                b_key = f"{prefix}.mlp.{hf_name}.bias"
+                proj = getattr(layer.mlp, proj_name, None)
+                if proj is not None and w_key in weights:
+                    # Check for quantized weights
+                    scales_key = w_key.replace(".weight", ".scales")
+                    biases_key = w_key.replace(".weight", ".biases")
+
+                    if scales_key in weights and biases_key in weights:
+                        # Load quantized weights
+                        proj.load_quantized_weights(
+                            weights[w_key],
+                            weights[scales_key],
+                            weights[biases_key],
+                        )
+                    else:
+                        proj.weight = weights[w_key]
+
+                    if b_key in weights:
+                        proj.bias = weights[b_key]
+
+        logger.debug(f"Loaded pipeline layer {global_layer_idx}")
 
 
 class HuggingFaceConverter:

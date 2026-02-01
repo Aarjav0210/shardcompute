@@ -401,6 +401,273 @@ class WeightSharder:
         return weights, metadata
 
 
+class PipelineWeightSharder:
+    """
+    Shards model weights for pipeline parallelism.
+
+    Instead of splitting every layer's weights across workers (TP),
+    this assigns complete layers to each worker. Each worker gets
+    full (unsplit) weights for its assigned layers.
+
+    Layer assignment is dynamic based on num_layers and world_size:
+    - layers_per_stage = num_layers // world_size
+    - Rank k gets layers [k * layers_per_stage, (k+1) * layers_per_stage)
+    - Rank 0 also gets the embedding layer
+    - Last rank also gets the final norm and lm_head
+
+    Weight names from HuggingFace follow the pattern:
+        model.layers.{i}.* for transformer layers
+        model.embed_tokens.* for embeddings
+        model.norm.* for final norm
+        lm_head.* for LM head
+    """
+
+    def __init__(
+        self,
+        model_config: ModelConfig,
+        parallel_config: ParallelConfig,
+    ):
+        self.model_config = model_config
+        self.parallel_config = parallel_config
+        self.world_size = parallel_config.pipeline_parallel_size
+        self.num_layers = model_config.num_layers
+
+        # Validate
+        parallel_config._validate_pipeline(model_config)
+
+    def _get_layer_range(self, rank: int) -> tuple:
+        """Get (start, end) layer indices for a rank."""
+        return self.parallel_config.get_pipeline_stage_layers(
+            rank, self.num_layers
+        )
+
+    def _is_layer_weight(self, name: str) -> bool:
+        """Check if a weight belongs to a numbered transformer layer."""
+        return "model.layers." in name or "layers." in name
+
+    def _get_layer_index(self, name: str) -> int:
+        """Extract layer index from weight name like 'model.layers.5.self_attn.q_proj.weight'."""
+        parts = name.split(".")
+        for i, part in enumerate(parts):
+            if part == "layers" and i + 1 < len(parts):
+                try:
+                    return int(parts[i + 1])
+                except ValueError:
+                    pass
+        raise ValueError(f"Cannot extract layer index from: {name}")
+
+    def _is_embedding_weight(self, name: str) -> bool:
+        """Check if weight is an embedding."""
+        return "embed_tokens" in name or "wte" in name
+
+    def _is_final_norm_weight(self, name: str) -> bool:
+        """Check if weight is the final layer norm."""
+        # Match model.norm but not model.layers.*.layernorm
+        if "layers." in name:
+            return False
+        return any(x in name for x in ["model.norm", "ln_f", "final_layernorm"])
+
+    def _is_lm_head_weight(self, name: str) -> bool:
+        """Check if weight is the LM head."""
+        return name.startswith("lm_head")
+
+    def _is_quantized_weight(self, name: str, weights: Dict[str, np.ndarray]) -> bool:
+        """Check if a weight has quantization components (scales and biases)."""
+        if not name.endswith(".weight"):
+            return False
+        base_name = name.rsplit(".weight", 1)[0]
+        scales_key = f"{base_name}.scales"
+        biases_key = f"{base_name}.biases"
+        return scales_key in weights and biases_key in weights
+
+    def _is_linear_weight(self, name: str) -> bool:
+        """Check if a weight is a linear layer (not norm/embedding)."""
+        if any(x in name for x in ["layernorm", "layer_norm", "norm", "ln"]):
+            return False
+        # Linear layers: projections, lm_head, etc.
+        return any(x in name for x in [
+            "q_proj", "k_proj", "v_proj", "o_proj", "dense",
+            "gate_proj", "up_proj", "down_proj", "fc1", "fc2",
+            "lm_head"
+        ])
+
+    def shard_weights(
+        self,
+        weights: Dict[str, np.ndarray],
+        rank: int,
+        tie_word_embeddings: bool = False,
+    ) -> Dict[str, np.ndarray]:
+        """
+        Select weights for a pipeline stage (rank).
+
+        For pipeline parallelism, weights are NOT split — each rank gets
+        the full weight tensors for its assigned layers. Linear weights are
+        transposed from HuggingFace [out, in] to MLX [in, out] format.
+
+        For quantized weights (with .scales and .biases), all three components
+        are transposed together to match MLX's quantization format.
+
+        Args:
+            weights: Full model weights dict
+            rank: Pipeline stage rank
+            tie_word_embeddings: If True, embedding weights are also included
+                on the last stage (for lm_head computation with tied embeddings)
+
+        Returns:
+            Dict of weights belonging to this rank (full, not split)
+        """
+        start_layer, end_layer = self._get_layer_range(rank)
+        is_first_stage = rank == 0
+        is_last_stage = rank == self.world_size - 1
+        sharded = {}
+        processed = set()  # Track processed quantized components
+
+        for name, weight in weights.items():
+            # Skip if already processed as part of quantized weight group
+            if name in processed:
+                continue
+
+            # Embedding → first stage, AND last stage if tie_word_embeddings
+            if self._is_embedding_weight(name):
+                include_embedding = is_first_stage or (is_last_stage and tie_word_embeddings)
+                if include_embedding:
+                    # Check for quantized embedding
+                    if self._is_quantized_weight(name, weights):
+                        base_name = name.rsplit(".weight", 1)[0]
+                        scales_key = f"{base_name}.scales"
+                        biases_key = f"{base_name}.biases"
+                        # Embeddings are not transposed (vocab_size, hidden_size) stays as-is
+                        sharded[name] = weight.copy()
+                        sharded[scales_key] = weights[scales_key].copy()
+                        sharded[biases_key] = weights[biases_key].copy()
+                        processed.add(scales_key)
+                        processed.add(biases_key)
+                    else:
+                        sharded[name] = weight.copy()
+                continue
+
+            # Final norm → last stage only
+            if self._is_final_norm_weight(name):
+                if is_last_stage:
+                    sharded[name] = weight.copy()
+                continue
+
+            # LM head → last stage only
+            if self._is_lm_head_weight(name):
+                if is_last_stage:
+                    # Check for quantized lm_head
+                    if self._is_quantized_weight(name, weights):
+                        base_name = name.rsplit(".weight", 1)[0]
+                        scales_key = f"{base_name}.scales"
+                        biases_key = f"{base_name}.biases"
+                        # Copy quantized lm_head as-is (MLX models already in correct format)
+                        sharded[name] = weight.copy()
+                        sharded[scales_key] = weights[scales_key].copy()
+                        sharded[biases_key] = weights[biases_key].copy()
+                        processed.add(scales_key)
+                        processed.add(biases_key)
+                    else:
+                        # Transpose standard lm_head to MLX format [in, out]
+                        if len(weight.shape) == 2:
+                            sharded[name] = weight.T.copy()
+                        else:
+                            sharded[name] = weight.copy()
+                continue
+
+            # Transformer layer weights
+            if self._is_layer_weight(name):
+                layer_idx = self._get_layer_index(name)
+                if start_layer <= layer_idx < end_layer:
+                    # Check for quantized weight
+                    if self._is_quantized_weight(name, weights):
+                        base_name = name.rsplit(".weight", 1)[0]
+                        scales_key = f"{base_name}.scales"
+                        biases_key = f"{base_name}.biases"
+
+                        # For quantized weights: copy as-is (no transpose)
+                        # MLX-format models (mlx-community/*) are already in correct format
+                        # Weights are already [out_features, in_features//2] for quantized
+                        sharded[name] = weight.copy()
+                        sharded[scales_key] = weights[scales_key].copy()
+                        sharded[biases_key] = weights[biases_key].copy()
+                        processed.add(scales_key)
+                        processed.add(biases_key)
+                    else:
+                        # Standard (non-quantized) weights
+                        # Transpose 2D linear weights to MLX format
+                        if len(weight.shape) == 2 and not any(
+                            x in name for x in ["layernorm", "layer_norm", "norm", "ln"]
+                        ):
+                            sharded[name] = weight.T.copy()
+                        else:
+                            sharded[name] = weight.copy()
+                continue
+
+            # Unknown weight — replicate to all stages
+            sharded[name] = weight.copy()
+
+        logger.info(
+            f"Pipeline rank {rank}: layers [{start_layer}, {end_layer}), "
+            f"{'+ embedding ' if is_first_stage else ''}"
+            f"{'+ norm/lm_head ' if is_last_stage else ''}"
+            f"({len(sharded)} tensors)"
+        )
+
+        return sharded
+
+    def save_shards(
+        self,
+        weights: Dict[str, np.ndarray],
+        output_dir: str,
+    ):
+        """
+        Shard weights by pipeline stage and save to disk.
+
+        Creates output_dir/rank_0/, output_dir/rank_1/, etc.
+        """
+        output_path = Path(output_dir)
+        output_path.mkdir(parents=True, exist_ok=True)
+
+        # Save config
+        config_data = {
+            "model": self.model_config.to_dict(),
+            "parallel": {
+                "world_size": self.world_size,
+                "mode": "pipeline",
+                "pipeline_parallel_size": self.parallel_config.pipeline_parallel_size,
+            },
+        }
+
+        with open(output_path / "config.json", "w") as f:
+            json.dump(config_data, f, indent=2)
+
+        # Check if model uses tied embeddings
+        tie_word_embeddings = getattr(self.model_config, 'tie_word_embeddings', False)
+
+        for rank in range(self.world_size):
+            rank_dir = output_path / f"rank_{rank}"
+            rank_dir.mkdir(exist_ok=True)
+
+            sharded = self.shard_weights(weights, rank, tie_word_embeddings=tie_word_embeddings)
+
+            save_safetensors(sharded, str(rank_dir / "model.safetensors"))
+
+            start_layer, end_layer = self._get_layer_range(rank)
+            metadata = {
+                "rank": rank,
+                "world_size": self.world_size,
+                "mode": "pipeline",
+                "start_layer": start_layer,
+                "end_layer": end_layer,
+                "num_tensors": len(sharded),
+                "tensor_shapes": {k: list(v.shape) for k, v in sharded.items()},
+            }
+            with open(rank_dir / "metadata.json", "w") as f:
+                json.dump(metadata, f, indent=2)
+
+            logger.info(f"Saved pipeline shards for rank {rank} to {rank_dir}")
+
+
 def _convert_mlx_to_numpy(tensor: mx.array) -> np.ndarray:
     """Convert MLX array to NumPy, handling bfloat16 conversion."""
     # NumPy doesn't support bfloat16, convert to float16

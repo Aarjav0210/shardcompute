@@ -65,3 +65,5 @@ dmypy.json
 # Environment variables
 .env
 .env.local
+
+*.prof

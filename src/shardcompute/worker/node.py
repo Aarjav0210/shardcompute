@@ -1,4 +1,4 @@
-"""Worker node for distributed tensor parallel inference."""
+"""Worker node for distributed tensor and pipeline parallel inference."""
 
 import asyncio
 import json
@@ -7,18 +7,18 @@ import signal
 import sys
 import traceback
 import argparse
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Union
 from pathlib import Path
 import yaml
 import aiohttp
 import mlx.core as mx
 
 from shardcompute.worker.peer_mesh import PeerMesh, MeshConfig
-from shardcompute.worker.executor import ParallelExecutor
+from shardcompute.worker.executor import ParallelExecutor, PipelineExecutor
 from shardcompute.worker.heartbeat import HeartbeatClient, HeartbeatConfig
-from shardcompute.parallel.transformer import ParallelTransformer
-from shardcompute.model.loader import ModelLoader
-from shardcompute.model.config import ModelConfig
+from shardcompute.parallel.transformer import ParallelTransformer, PipelineParallelTransformer
+from shardcompute.model.loader import ModelLoader, PipelineModelLoader, detect_parallelism_mode
+from shardcompute.model.config import ModelConfig, ParallelConfig
 from shardcompute.protocol.messages import WorkerInfo, InferenceRequest, InferenceResponse, StreamingToken
 
 logger = logging.getLogger(__name__)
@@ -68,17 +68,27 @@ class WorkerNode:
         
         # Components (initialized during setup)
         self.peer_mesh: Optional[PeerMesh] = None
-        self.executor: Optional[ParallelExecutor] = None
+        self.executor: Optional[Union[ParallelExecutor, PipelineExecutor]] = None
         self.heartbeat: Optional[HeartbeatClient] = None
-        self.model: Optional[ParallelTransformer] = None
-        
+        self.model: Optional[Union[ParallelTransformer, PipelineParallelTransformer]] = None
+
+        # Detect parallelism mode from config or shard directory
+        parallelism_cfg = self.config.get("parallelism", {})
+        self._parallelism_mode = parallelism_cfg.get("mode", "tensor")
+
         # State
         self._running = False
-        self._world_size = self.config.get("parallelism", {}).get("tensor_parallel_size", 2)
+        if self._parallelism_mode == "pipeline":
+            self._world_size = parallelism_cfg.get("pipeline_parallel_size", 2)
+        else:
+            self._world_size = parallelism_cfg.get("tensor_parallel_size", 2)
         self._inference_lock = asyncio.Lock()
         self._http_session: Optional[aiohttp.ClientSession] = None
-        
-        logger.info(f"WorkerNode initialized: rank {rank}, coordinator {coordinator_url}")
+
+        logger.info(
+            f"WorkerNode initialized: rank {rank}, coordinator {coordinator_url}, "
+            f"mode={self._parallelism_mode}"
+        )
     
     def _load_config(self, config_path: Optional[str]) -> Dict[str, Any]:
         """Load configuration from file."""
@@ -232,13 +242,29 @@ class WorkerNode:
     
     async def _load_model(self):
         """Load model with weight shards."""
+        # Override mode from shard directory if available
+        if self.shard_dir and self.shard_dir.exists():
+            detected_mode = detect_parallelism_mode(self.shard_dir)
+            if detected_mode != self._parallelism_mode:
+                logger.info(
+                    f"Rank {self.rank}: shard directory mode '{detected_mode}' overrides "
+                    f"config mode '{self._parallelism_mode}'"
+                )
+                self._parallelism_mode = detected_mode
+
+        if self._parallelism_mode == "pipeline":
+            await self._load_model_pipeline()
+        else:
+            await self._load_model_tensor()
+
+    async def _load_model_tensor(self):
+        """Load model for tensor parallelism (existing behavior)."""
         model_config = self.config.get("model", {})
-        
+
         # Try to load config from shard directory first (has actual model config)
         if self.shard_dir and (self.shard_dir / "config.json").exists():
             with open(self.shard_dir / "config.json") as f:
                 shard_config = json.load(f)
-            # Handle nested structure from sharder ({"model": {...}, "parallel": {...}})
             if "model" in shard_config:
                 config = ModelConfig.from_dict(shard_config["model"])
             else:
@@ -246,19 +272,18 @@ class WorkerNode:
             kv_info = f", {config.num_kv_heads} KV heads (GQA)" if config.num_kv_heads else ""
             logger.info(f"Rank {self.rank} loaded model config: {config.num_heads} heads{kv_info}")
         else:
-            # Fall back to YAML config
             config = ModelConfig(
                 vocab_size=model_config.get("vocab_size", 32000),
                 hidden_size=model_config.get("hidden_size", 2048),
                 num_layers=model_config.get("num_layers", 22),
                 num_heads=model_config.get("num_heads", 32),
-                num_kv_heads=model_config.get("num_kv_heads"),  # GQA support
+                num_kv_heads=model_config.get("num_kv_heads"),
                 intermediate_size=model_config.get("intermediate_size", 5632),
                 max_position_embeddings=model_config.get("max_position_embeddings", 2048),
                 rms_norm_eps=model_config.get("rms_norm_eps", 1e-5),
                 rope_theta=model_config.get("rope_theta", 10000.0),
             )
-        
+
         # Check for quantized weights before creating model
         is_quantized = False
         quantization_bits = 4
@@ -268,7 +293,6 @@ class WorkerNode:
             is_quantized = ModelLoader.detect_quantization(self.shard_dir, self.rank)
             if is_quantized:
                 logger.info(f"Rank {self.rank}: Quantized weights detected, enabling quantized inference")
-                # Get quantization parameters from config if available
                 if config.quantization:
                     quantization_bits = config.quantization.bits
                     quantization_group_size = config.quantization.group_size
@@ -284,12 +308,12 @@ class WorkerNode:
             world_size=self._world_size,
             rank=self.rank,
             communicator=self.peer_mesh.get_communicator(),
-            num_kv_heads=config.num_kv_heads,  # GQA support
+            num_kv_heads=config.num_kv_heads,
             max_position_embeddings=config.max_position_embeddings,
             rms_norm_eps=config.rms_norm_eps,
-            rope_base=config.rope_theta,  # RoPE base frequency
-            mlp_activation=config.hidden_act,  # MLP activation function
-            use_gated_mlp=config.use_gated_mlp,  # Gated MLP (LLaMA) vs simple (Phi-2)
+            rope_base=config.rope_theta,
+            mlp_activation=config.hidden_act,
+            use_gated_mlp=config.use_gated_mlp,
             tie_word_embeddings=config.tie_word_embeddings,
             use_quantized=is_quantized,
             quantization_bits=quantization_bits,
@@ -298,13 +322,12 @@ class WorkerNode:
 
         # Load weight shards if directory provided
         if self.shard_dir and self.shard_dir.exists():
-
             loader = ModelLoader(self.rank, self._world_size, quantized=is_quantized)
             await loader.load_shards(self.model, self.shard_dir)
             logger.info(f"Rank {self.rank} loaded model shards from {self.shard_dir}")
         else:
             logger.warning(f"Rank {self.rank} no shard directory, using uninitialized weights")
-        
+
         # Create executor
         self.executor = ParallelExecutor(
             rank=self.rank,
@@ -312,8 +335,88 @@ class WorkerNode:
             communicator=self.peer_mesh.get_communicator(),
             model=self.model,
         )
-        
-        logger.info(f"Rank {self.rank} model loaded: {self.model.num_parameters:,} parameters")
+
+        logger.info(f"Rank {self.rank} model loaded (tensor): {self.model.num_parameters:,} parameters")
+
+    async def _load_model_pipeline(self):
+        """Load model for pipeline parallelism."""
+        model_config = self.config.get("model", {})
+
+        # Load config from shard directory
+        if self.shard_dir and (self.shard_dir / "config.json").exists():
+            with open(self.shard_dir / "config.json") as f:
+                shard_config = json.load(f)
+            if "model" in shard_config:
+                config = ModelConfig.from_dict(shard_config["model"])
+            else:
+                config = ModelConfig.from_dict(shard_config)
+        else:
+            config = ModelConfig(
+                vocab_size=model_config.get("vocab_size", 32000),
+                hidden_size=model_config.get("hidden_size", 2048),
+                num_layers=model_config.get("num_layers", 22),
+                num_heads=model_config.get("num_heads", 32),
+                num_kv_heads=model_config.get("num_kv_heads"),
+                intermediate_size=model_config.get("intermediate_size", 5632),
+                max_position_embeddings=model_config.get("max_position_embeddings", 2048),
+                rms_norm_eps=model_config.get("rms_norm_eps", 1e-5),
+                rope_theta=model_config.get("rope_theta", 10000.0),
+            )
+
+        # Compute layer assignment
+        parallel_config = ParallelConfig(
+            world_size=self._world_size,
+            rank=self.rank,
+            mode="pipeline",
+            pipeline_parallel_size=self._world_size,
+        )
+        start_layer, end_layer = parallel_config.get_pipeline_stage_layers(
+            self.rank, config.num_layers
+        )
+
+        logger.info(
+            f"Rank {self.rank} pipeline stage: layers [{start_layer}, {end_layer}), "
+            f"{config.num_layers} total layers across {self._world_size} workers"
+        )
+
+        # Create pipeline model
+        self.model = PipelineParallelTransformer(
+            vocab_size=config.vocab_size,
+            hidden_size=config.hidden_size,
+            num_layers=config.num_layers,
+            num_heads=config.num_heads,
+            intermediate_size=config.intermediate_size,
+            world_size=self._world_size,
+            rank=self.rank,
+            communicator=self.peer_mesh.get_communicator(),
+            num_kv_heads=config.num_kv_heads,
+            max_position_embeddings=config.max_position_embeddings,
+            rms_norm_eps=config.rms_norm_eps,
+            rope_base=config.rope_theta,
+            mlp_activation=config.hidden_act,
+            use_gated_mlp=config.use_gated_mlp,
+            tie_word_embeddings=config.tie_word_embeddings,
+        )
+
+        # Load pipeline weight shards
+        if self.shard_dir and self.shard_dir.exists():
+            loader = PipelineModelLoader(
+                self.rank, self._world_size, start_layer, end_layer
+            )
+            await loader.load_shards(self.model, self.shard_dir)
+            logger.info(f"Rank {self.rank} loaded pipeline model shards from {self.shard_dir}")
+        else:
+            logger.warning(f"Rank {self.rank} no shard directory, using uninitialized weights")
+
+        # Create pipeline executor
+        self.executor = PipelineExecutor(
+            rank=self.rank,
+            world_size=self._world_size,
+            communicator=self.peer_mesh.get_communicator(),
+            model=self.model,
+        )
+
+        logger.info(f"Rank {self.rank} model loaded (pipeline): {self.model.num_parameters:,} parameters")
     
     async def _start_heartbeat(self):
         """Start heartbeat client."""
@@ -380,43 +483,44 @@ class WorkerNode:
     
     async def _follower_loop(self):
         """Main loop for non-rank-0 workers - wait for broadcasts."""
-        logger.info(f"Rank {self.rank} starting follower loop")
-        
+        if self._parallelism_mode == "pipeline":
+            await self._follower_loop_pipeline()
+        else:
+            await self._follower_loop_tensor()
+
+    async def _follower_loop_tensor(self):
+        """Follower loop for tensor parallelism — all workers run all layers."""
+        logger.info(f"Rank {self.rank} starting tensor follower loop")
+
         while self._running:
             try:
-                # Flush stale data from previous failed inference cycles
                 comm = self.peer_mesh.get_communicator()
                 comm.flush_peers()
 
                 # Wait for generation parameters broadcast from rank 0
-                # Format: [input_ids_len, max_new_tokens, temperature (scaled), top_p (scaled), num_stop_tokens]
                 params = await comm.broadcast(None, root=0)
-                
+
                 if params.size == 0:
                     logger.warning(f"Rank {self.rank} received empty broadcast")
                     continue
-                
-                # Decode parameters
+
                 params_list = params.tolist()
                 input_len = int(params_list[0])
                 max_new_tokens = int(params_list[1]) if len(params_list) > 1 else 0
                 temperature = float(params_list[2]) / 1000.0 if len(params_list) > 2 else 0.7
                 top_p = float(params_list[3]) / 1000.0 if len(params_list) > 3 else 0.9
                 num_stop_tokens = int(params_list[4]) if len(params_list) > 4 else 0
-                
-                # Receive stop tokens if any
+
                 stop_tokens = []
                 if num_stop_tokens > 0:
                     stop_tokens_array = await comm.broadcast(None, root=0)
                     stop_tokens = stop_tokens_array.tolist()
-                
-                # Receive actual input_ids
+
                 input_ids = await comm.broadcast(None, root=0)
-                
+
                 logger.info(f"Rank {self.rank} starting generation: {input_len} input tokens, "
                            f"{max_new_tokens} max new tokens, stop_tokens={stop_tokens}")
-                
-                # Execute same operation as rank 0
+
                 if max_new_tokens > 0:
                     await self.executor.generate(
                         input_ids,
@@ -427,14 +531,76 @@ class WorkerNode:
                     )
                 else:
                     await self.executor.forward(input_ids)
-                
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 error_msg = f"{type(e).__name__}: {str(e)}\n{traceback.format_exc()}"
                 logger.error(f"Follower loop error: {error_msg}")
-        
-        logger.info(f"Rank {self.rank} follower loop ended")
+
+        logger.info(f"Rank {self.rank} tensor follower loop ended")
+
+    async def _follower_loop_pipeline(self):
+        """
+        Follower loop for pipeline parallelism.
+
+        Non-rank-0 stages receive coordination parameters via broadcast,
+        then participate in the pipeline forward pass. Hidden states flow
+        through the pipeline via point-to-point send/recv inside the executor.
+        """
+        logger.info(f"Rank {self.rank} starting pipeline follower loop")
+
+        while self._running:
+            try:
+                comm = self.peer_mesh.get_communicator()
+                comm.flush_peers()
+
+                # Wait for generation parameters broadcast from rank 0
+                params = await comm.broadcast(None, root=0)
+
+                if params.size == 0:
+                    logger.warning(f"Rank {self.rank} received empty broadcast")
+                    continue
+
+                params_list = params.tolist()
+                input_len = int(params_list[0])
+                max_new_tokens = int(params_list[1]) if len(params_list) > 1 else 0
+                temperature = float(params_list[2]) / 1000.0 if len(params_list) > 2 else 0.7
+                top_p = float(params_list[3]) / 1000.0 if len(params_list) > 3 else 0.9
+                num_stop_tokens = int(params_list[4]) if len(params_list) > 4 else 0
+
+                stop_tokens = []
+                if num_stop_tokens > 0:
+                    stop_tokens_array = await comm.broadcast(None, root=0)
+                    stop_tokens = stop_tokens_array.tolist()
+
+                # Receive input_ids (needed for generate's broadcast token sync)
+                input_ids = await comm.broadcast(None, root=0)
+
+                logger.info(
+                    f"Rank {self.rank} pipeline stage starting: {input_len} input tokens, "
+                    f"{max_new_tokens} max new tokens"
+                )
+
+                # Pipeline executor handles point-to-point hidden state transfer
+                if max_new_tokens > 0:
+                    await self.executor.generate(
+                        input_ids,
+                        max_new_tokens=max_new_tokens,
+                        temperature=temperature,
+                        top_p=top_p,
+                        stop_tokens=stop_tokens,
+                    )
+                else:
+                    await self.executor.forward(input_ids=input_ids)
+
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                error_msg = f"{type(e).__name__}: {str(e)}\n{traceback.format_exc()}"
+                logger.error(f"Pipeline follower loop error: {error_msg}")
+
+        logger.info(f"Rank {self.rank} pipeline follower loop ended")
     
     async def _process_inference(self, request: InferenceRequest):
         """Process an inference request (rank 0 only)."""

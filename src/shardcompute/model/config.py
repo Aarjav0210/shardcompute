@@ -1,7 +1,7 @@
 """Model and parallelism configuration."""
 
 from dataclasses import dataclass, field
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List, Tuple
 from pathlib import Path
 import json
 
@@ -108,55 +108,74 @@ class ModelConfig:
 
 @dataclass
 class ParallelConfig:
-    """Configuration for tensor parallelism."""
-    
+    """Configuration for tensor and pipeline parallelism."""
+
     world_size: int = 2
     rank: int = 0
-    
+
+    # Parallelism mode: "tensor" or "pipeline"
+    mode: str = "tensor"
+
     # Parallelism strategy
     tensor_parallel_size: int = 2
-    pipeline_parallel_size: int = 1  # Not used in POC
-    
+    pipeline_parallel_size: int = 2
+
     # For 2D parallelism (future)
     row_parallel_size: int = 1
     col_parallel_size: int = 1
-    
+
     @classmethod
     def from_dict(cls, data: Dict[str, Any], rank: int = 0) -> "ParallelConfig":
         """Create config from dictionary."""
+        mode = data.get("mode", "tensor")
         tp_size = data.get("tensor_parallel_size", 2)
+        pp_size = data.get("pipeline_parallel_size", 2)
+
+        if mode == "pipeline":
+            world_size = pp_size
+        else:
+            world_size = tp_size
+
         return cls(
-            world_size=tp_size,
+            world_size=world_size,
             rank=rank,
+            mode=mode,
             tensor_parallel_size=tp_size,
-            pipeline_parallel_size=data.get("pipeline_parallel_size", 1),
+            pipeline_parallel_size=pp_size,
             row_parallel_size=data.get("row_parallel_size", 1),
             col_parallel_size=data.get("col_parallel_size", 1),
         )
-    
-    def validate(self, model_config: ModelConfig):
+
+    def validate(self, model_config: "ModelConfig"):
         """Validate parallelism config against model config."""
+        if self.mode == "pipeline":
+            self._validate_pipeline(model_config)
+        else:
+            self._validate_tensor(model_config)
+
+    def _validate_tensor(self, model_config: "ModelConfig"):
+        """Validate tensor parallelism config against model config."""
         # Check head divisibility
         if model_config.num_heads % self.tensor_parallel_size != 0:
             raise ValueError(
                 f"num_heads ({model_config.num_heads}) must be divisible by "
                 f"tensor_parallel_size ({self.tensor_parallel_size})"
             )
-        
+
         # Check hidden size divisibility
         if model_config.hidden_size % self.tensor_parallel_size != 0:
             raise ValueError(
                 f"hidden_size ({model_config.hidden_size}) must be divisible by "
                 f"tensor_parallel_size ({self.tensor_parallel_size})"
             )
-        
+
         # Check intermediate size divisibility
         if model_config.intermediate_size % self.tensor_parallel_size != 0:
             raise ValueError(
                 f"intermediate_size ({model_config.intermediate_size}) must be divisible by "
                 f"tensor_parallel_size ({self.tensor_parallel_size})"
             )
-        
+
         # Check KV heads for GQA
         if model_config.num_kv_heads:
             if model_config.num_kv_heads % self.tensor_parallel_size != 0:
@@ -164,6 +183,44 @@ class ParallelConfig:
                     f"num_kv_heads ({model_config.num_kv_heads}) must be divisible by "
                     f"tensor_parallel_size ({self.tensor_parallel_size})"
                 )
+
+    def _validate_pipeline(self, model_config: "ModelConfig"):
+        """Validate pipeline parallelism config against model config."""
+        if model_config.num_layers % self.pipeline_parallel_size != 0:
+            raise ValueError(
+                f"num_layers ({model_config.num_layers}) must be divisible by "
+                f"pipeline_parallel_size ({self.pipeline_parallel_size})"
+            )
+
+    def get_pipeline_stage_layers(
+        self, rank: int, num_layers: int
+    ) -> Tuple[int, int]:
+        """
+        Get the layer range assigned to a pipeline stage (rank).
+
+        Divides layers evenly across pipeline stages.
+
+        Args:
+            rank: Pipeline stage rank
+            num_layers: Total number of layers in the model
+
+        Returns:
+            (start_layer, end_layer) — exclusive end, i.e. layers [start, end)
+        """
+        layers_per_stage = num_layers // self.pipeline_parallel_size
+        start = rank * layers_per_stage
+        end = start + layers_per_stage
+        return start, end
+
+    @property
+    def is_pipeline(self) -> bool:
+        """Whether pipeline parallelism is active."""
+        return self.mode == "pipeline"
+
+    @property
+    def is_tensor(self) -> bool:
+        """Whether tensor parallelism is active."""
+        return self.mode == "tensor"
 
 
 @dataclass
