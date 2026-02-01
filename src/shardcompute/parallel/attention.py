@@ -518,7 +518,98 @@ class ParallelAttention:
         
         # Return partial (before all-reduce)
         return self.o_proj.forward_partial(attn_output)
-    
+
+    def forward_partial_with_cache(
+        self,
+        hidden_states: mx.array,
+        attention_mask: Optional[mx.array] = None,
+        past_key_value: Optional[Tuple[mx.array, mx.array]] = None,
+        use_cache: bool = False,
+    ) -> Tuple[mx.array, Optional[Tuple[mx.array, mx.array]]]:
+        """
+        Compute attention without all-reduce, with KV cache support.
+
+        Returns partial output (before all-reduce) and optionally the KV cache.
+        Use this with start_all_reduce/wait_all_reduce for pipelined execution.
+
+        Args:
+            hidden_states: [batch, seq_len, hidden_size] - REPLICATED
+            attention_mask: Optional attention mask
+            past_key_value: Cached K, V from previous steps
+            use_cache: Whether to return updated cache
+
+        Returns:
+            partial_output: [batch, seq_len, hidden_size] - PARTIAL (needs all-reduce)
+            cache: Updated (K, V) cache if use_cache=True
+        """
+        batch_size, seq_len, _ = hidden_states.shape
+
+        # Column-parallel QKV projections (no communication)
+        q = self.q_proj.forward_sync(hidden_states)
+        k = self.k_proj.forward_sync(hidden_states)
+        v = self.v_proj.forward_sync(hidden_states)
+
+        # Reshape for multi-head attention
+        q = q.reshape(batch_size, seq_len, self.local_num_heads, self.head_dim)
+        q = q.transpose(0, 2, 1, 3)
+
+        k = k.reshape(batch_size, seq_len, self.local_num_kv_heads, self.head_dim)
+        k = k.transpose(0, 2, 1, 3)
+
+        v = v.reshape(batch_size, seq_len, self.local_num_kv_heads, self.head_dim)
+        v = v.transpose(0, 2, 1, 3)
+
+        # Calculate position offset for RoPE (from KV cache)
+        position_offset = 0
+        if past_key_value is not None:
+            position_offset = past_key_value[0].shape[2]
+
+        # Apply RoPE to Q and K
+        q, k = self.rope(q, k, position_offset=position_offset)
+
+        # Handle KV cache
+        if past_key_value is not None:
+            past_k, past_v = past_key_value
+            k = mx.concatenate([past_k, k], axis=2)
+            v = mx.concatenate([past_v, v], axis=2)
+
+        new_cache = (k, v) if use_cache else None
+        kv_seq_len = k.shape[2]
+
+        # Handle grouped-query attention
+        if self.local_num_kv_heads < self.local_num_heads:
+            repeat_factor = self.local_num_heads // self.local_num_kv_heads
+            k = mx.repeat(k, repeat_factor, axis=1)
+            v = mx.repeat(v, repeat_factor, axis=1)
+
+        # Scaled dot-product attention
+        attn_scores = (q @ k.transpose(0, 1, 3, 2)) * self.scale
+
+        # Apply attention mask
+        if attention_mask is not None:
+            attn_scores = attn_scores + attention_mask
+
+        # Create causal mask if needed
+        if seq_len > 1:
+            causal_mask = mx.triu(
+                mx.full((seq_len, kv_seq_len), float('-inf')),
+                k=kv_seq_len - seq_len + 1
+            )
+            attn_scores = attn_scores + causal_mask
+
+        # Softmax and attention output
+        attn_weights = mx.softmax(attn_scores, axis=-1)
+        attn_output = attn_weights @ v
+
+        # Reshape
+        attn_output = attn_output.transpose(0, 2, 1, 3)
+        attn_output = attn_output.reshape(batch_size, seq_len, self.local_hidden)
+
+        # Return partial output (before all-reduce) and cache
+        partial_output = self.o_proj.forward_partial(attn_output)
+
+        return partial_output, new_cache
+
     @property
     def num_parameters(self) -> int:
         """Number of parameters in this shard."""

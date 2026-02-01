@@ -1,0 +1,11 @@
+# Coordinator-only requirements (no MLX)
+# Use this on Linux/CPU-only hosts for the coordinator server.
+
+numpy>=1.24.0
+aiohttp>=3.9.0
+msgpack>=1.0.0
+safetensors>=0.4.0
+transformers>=4.36.0
+huggingface-hub>=0.20.0
+rich>=13.0.0
+pyyaml>=6.0.0

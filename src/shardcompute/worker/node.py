@@ -130,35 +130,45 @@ class WorkerNode:
             await self.stop()
     
     async def _register_with_coordinator(self):
-        """Register this worker with the coordinator."""
-        url = f"{self.coordinator_url}/api/workers/register"
-        
+        """Register this worker with the coordinator.
+
+        Uses the endpoint structure from COMMUNICATION_OUTLINE.md.
+        """
+        url = f"{self.coordinator_url}/workers/register"
+
         payload = {
+            "worker_id": f"worker-{self.rank}",
             "rank": self.rank,
             "host": self.host,
             "port": self.collective_port,
             "collective_port": self.collective_port,
+            "hardware_type": "apple_silicon",
             "device_info": {
                 "platform": "apple_silicon",
                 "mlx_version": mx.__version__ if hasattr(mx, '__version__') else "unknown",
             },
         }
-        
+
         logger.info(f"Rank {self.rank} registering with coordinator")
-        
+
         async with self._http_session.post(url, json=payload) as response:
             if response.status != 200:
                 error = await response.text()
                 raise RuntimeError(f"Registration failed: {error}")
-            
+
             data = await response.json()
             self._world_size = data.get("world_size", self._world_size)
-            
+
+            # Log initial_peers if available (multiaddr format)
+            initial_peers = data.get("initial_peers", [])
+            if initial_peers:
+                logger.debug(f"Rank {self.rank} received initial_peers: {initial_peers}")
+
         logger.info(f"Rank {self.rank} registered successfully, world_size={self._world_size}")
     
     async def _wait_for_cluster(self) -> List[WorkerInfo]:
         """Wait for all workers to register and get peer list."""
-        url = f"{self.coordinator_url}/api/workers/list"
+        url = f"{self.coordinator_url}/workers"
         
         logger.info(f"Rank {self.rank} waiting for cluster formation")
         
@@ -186,25 +196,39 @@ class WorkerNode:
     
     async def _setup_peer_mesh(self, peers: List[WorkerInfo]):
         """Setup peer mesh and establish connections."""
+        worker_config = self.config.get("worker", {})
+        transport = worker_config.get("transport", "ws_relay")
+
+        coordinator_ws_url = None
+        if transport == "ws_relay":
+            coordinator_ws_url = (
+                self.coordinator_url
+                .replace("http://", "ws://")
+                .replace("https://", "wss://")
+                + "/ws/collective"
+            )
+
         config = MeshConfig(
             world_size=self._world_size,
-            connection_timeout=self.config.get("worker", {}).get("collective_timeout_seconds", 30),
+            connection_timeout=worker_config.get("collective_timeout_seconds", 30),
+            transport=transport,
+            coordinator_ws_url=coordinator_ws_url,
         )
-        
+
         self.peer_mesh = PeerMesh(
             rank=self.rank,
             host=self.host,
             port=self.collective_port,
             config=config,
         )
-        
+
         self.peer_mesh.set_peers(peers)
-        
+
         success = await self.peer_mesh.connect()
         if not success:
             raise RuntimeError("Failed to connect peer mesh")
-        
-        logger.info(f"Rank {self.rank} peer mesh connected")
+
+        logger.info(f"Rank {self.rank} peer mesh connected via {transport}")
     
     async def _load_model(self):
         """Load model with weight shards."""
@@ -328,7 +352,7 @@ class WorkerNode:
     
     async def _inference_loop(self):
         """Main loop for rank 0 - receive and process inference requests."""
-        url = f"{self.coordinator_url}/api/inference/poll"
+        url = f"{self.coordinator_url}/inference/poll"
         
         logger.info(f"Rank 0 starting inference loop")
         
@@ -360,9 +384,12 @@ class WorkerNode:
         
         while self._running:
             try:
+                # Flush stale data from previous failed inference cycles
+                comm = self.peer_mesh.get_communicator()
+                comm.flush_peers()
+
                 # Wait for generation parameters broadcast from rank 0
                 # Format: [input_ids_len, max_new_tokens, temperature (scaled), top_p (scaled), num_stop_tokens]
-                comm = self.peer_mesh.get_communicator()
                 params = await comm.broadcast(None, root=0)
                 
                 if params.size == 0:
@@ -418,8 +445,9 @@ class WorkerNode:
                 # Convert input to tensor
                 input_ids = mx.array([request.input_ids], dtype=mx.int32)
 
-                # Broadcast parameters to followers so they know what to do
+                # Flush stale data from previous failed inference cycles
                 comm = self.peer_mesh.get_communicator()
+                comm.flush_peers()
 
                 # First broadcast number of stop tokens
                 num_stop_tokens = len(request.stop_tokens) if request.stop_tokens else 0
@@ -508,7 +536,7 @@ class WorkerNode:
     
     async def _send_response(self, response: InferenceResponse):
         """Send inference response to coordinator."""
-        url = f"{self.coordinator_url}/api/inference/response"
+        url = f"{self.coordinator_url}/inference/response"
 
         async with self._http_session.post(url, json=response.to_dict()) as resp:
             if resp.status != 200:
@@ -516,7 +544,7 @@ class WorkerNode:
 
     async def _send_streaming_token(self, token: StreamingToken):
         """Send a streaming token to coordinator."""
-        url = f"{self.coordinator_url}/api/inference/stream/token"
+        url = f"{self.coordinator_url}/inference/stream/token"
 
         try:
             async with self._http_session.post(

@@ -13,11 +13,16 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class HealthConfig:
-    """Configuration for health monitoring."""
-    
-    heartbeat_timeout: float = 15.0  # Time without heartbeat before marking unhealthy
-    check_interval: float = 5.0  # How often to check health
-    failure_threshold: int = 3  # Missed heartbeats before marking failed
+    """Configuration for health monitoring.
+
+    Default timing matches COMMUNICATION_OUTLINE.md:
+    - Workers marked offline after 60s without heartbeat
+    - Background cleanup loop runs every 30s
+    """
+
+    heartbeat_timeout: float = 60.0  # Changed from 15.0 to match COMMUNICATION_OUTLINE
+    check_interval: float = 30.0  # Changed from 5.0 to match COMMUNICATION_OUTLINE
+    failure_threshold: int = 2  # 2 missed checks * 30s = 60s total
 
 
 class HealthMonitor:

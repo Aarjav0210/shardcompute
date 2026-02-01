@@ -95,10 +95,14 @@ class Communicator:
         
         # Stats
         self.stats = CommunicatorStats()
-        
+
         # State
         self._initialized = False
         self._barrier_counter = 0
+
+        # Async all-reduce tracking
+        self._pending_all_reduces: Dict[str, asyncio.Task] = {}
+        self._all_reduce_counter = 0
     
     @property
     def is_initialized(self) -> bool:
@@ -178,6 +182,57 @@ class Communicator:
         self._initialized = True
         logger.info(f"Rank {self.rank} communicator initialized successfully")
     
+    async def initialize_ws_relay(
+        self,
+        coordinator_ws_url: str,
+        peer_infos: List[PeerInfo],
+        timeout: float = 30.0,
+    ):
+        """
+        Initialize connections via WebSocket relay through coordinator.
+
+        Instead of direct TCP, each peer connection is a
+        WebSocketRelayConnection that routes traffic through the
+        coordinator's /ws/collective/{rank} endpoint.
+        """
+        if self._initialized:
+            logger.warning("Communicator already initialized")
+            return
+
+        logger.info(f"Rank {self.rank} initializing communicator via WS relay")
+
+        from shardcompute.collectives.ws_relay import WebSocketRelayManager
+
+        self._relay_manager = WebSocketRelayManager(
+            rank=self.rank,
+            coordinator_ws_url=coordinator_ws_url,
+            world_size=self.world_size,
+            timeout=timeout,
+        )
+        await self._relay_manager.connect()
+
+        # Create relay connections for each peer
+        for other_rank in range(self.world_size):
+            if other_rank == self.rank:
+                continue
+            self.peers[other_rank] = self._relay_manager.get_connection(other_rank)
+
+        # Create topology
+        self.topology = create_topology(
+            self.topology_type,
+            self.rank,
+            self.world_size,
+            peer_infos,
+        )
+
+        # Initialize collective operations (same as TCP path)
+        self._all_reduce = RingAllReduce(self.rank, self.world_size, self.peers, self.topology)
+        self._all_gather = AllGather(self.rank, self.world_size, self.peers, self.topology)
+        self._reduce_scatter = ReduceScatter(self.rank, self.world_size, self.peers)
+
+        self._initialized = True
+        logger.info(f"Rank {self.rank} communicator initialized via WS relay")
+
     async def _connect_to_peer(
         self,
         connection: PeerConnection,
@@ -232,7 +287,136 @@ class Communicator:
         self.stats.total_bytes_received += self._all_reduce.last_bytes_transferred // 2
         
         return result
-    
+
+    def start_all_reduce(
+        self,
+        tensor: mx.array,
+        op: str = "sum",
+    ) -> str:
+        """
+        Start a non-blocking all-reduce and return an operation ID.
+
+        Use wait_all_reduce() to retrieve the result. This allows overlapping
+        communication with computation.
+
+        Args:
+            tensor: Local tensor to reduce
+            op: Reduction operation ('sum', 'mean', 'max', 'min')
+
+        Returns:
+            Operation ID to pass to wait_all_reduce()
+        """
+        if not self._initialized:
+            raise RuntimeError("Communicator not initialized")
+
+        # Evaluate tensor before starting async operation
+        mx.eval(tensor)
+
+        self._all_reduce_counter += 1
+        op_id = f"ar_{self.rank}_{self._all_reduce_counter}"
+
+        async def _do_all_reduce():
+            start_time = time.perf_counter()
+            result = await self._all_reduce.all_reduce(tensor, op)
+            elapsed = (time.perf_counter() - start_time) * 1000
+            return result, elapsed
+
+        task = asyncio.create_task(_do_all_reduce())
+        self._pending_all_reduces[op_id] = task
+
+        return op_id
+
+    async def wait_all_reduce(self, op_id: str) -> mx.array:
+        """
+        Wait for a non-blocking all-reduce to complete and return the result.
+
+        Args:
+            op_id: Operation ID from start_all_reduce()
+
+        Returns:
+            Reduced tensor (identical on all workers)
+        """
+        if op_id not in self._pending_all_reduces:
+            raise ValueError(f"Unknown all-reduce operation ID: {op_id}")
+
+        task = self._pending_all_reduces.pop(op_id)
+        result, elapsed = await task
+
+        # Update stats
+        self.stats.total_all_reduce_calls += 1
+        self.stats.total_all_reduce_time_ms += elapsed
+        self.stats.total_bytes_sent += self._all_reduce.last_bytes_transferred // 2
+        self.stats.total_bytes_received += self._all_reduce.last_bytes_transferred // 2
+
+        return result
+
+    async def all_reduce_batch(
+        self,
+        tensors: List[mx.array],
+        op: str = "sum",
+    ) -> List[mx.array]:
+        """
+        Perform batched all-reduce on multiple tensors.
+
+        Concatenates tensors, performs single all-reduce, then splits result.
+        This reduces the number of network round-trips at the cost of sending
+        a larger message.
+
+        Args:
+            tensors: List of tensors to reduce (must all have same dtype)
+            op: Reduction operation
+
+        Returns:
+            List of reduced tensors (same order as input)
+        """
+        if not self._initialized:
+            raise RuntimeError("Communicator not initialized")
+
+        if len(tensors) == 0:
+            return []
+        if len(tensors) == 1:
+            return [await self.all_reduce(tensors[0], op)]
+
+        start_time = time.perf_counter()
+
+        # Flatten and concatenate all tensors
+        flattened = []
+        shapes = []
+        sizes = []
+        dtype = tensors[0].dtype
+
+        for tensor in tensors:
+            if tensor.dtype != dtype:
+                raise ValueError("All tensors must have same dtype for batched all-reduce")
+            flat = tensor.reshape(-1)
+            flattened.append(flat)
+            shapes.append(tensor.shape)
+            sizes.append(flat.size)
+
+        # Concatenate into single tensor
+        combined = mx.concatenate(flattened, axis=0)
+
+        # Single all-reduce
+        reduced = await self._all_reduce.all_reduce(combined, op)
+
+        # Split back into original tensors
+        results = []
+        offset = 0
+        for i, (shape, size) in enumerate(zip(shapes, sizes)):
+            result = reduced[offset:offset + size].reshape(shape)
+            results.append(result)
+            offset += size
+
+        elapsed = (time.perf_counter() - start_time) * 1000
+
+        # Update stats (count as 1 all-reduce with combined size)
+        self.stats.total_all_reduce_calls += 1
+        self.stats.total_all_reduce_time_ms += elapsed
+        self.stats.total_bytes_sent += self._all_reduce.last_bytes_transferred // 2
+        self.stats.total_bytes_received += self._all_reduce.last_bytes_transferred // 2
+
+        return results
+
     async def all_gather(
         self,
         tensor: mx.array,
@@ -376,6 +560,19 @@ class Communicator:
         
         return await self.peers[source].recv_tensor()
     
+    def flush_peers(self):
+        """Flush all peer recv queues to discard stale data.
+
+        Call at the start of each inference cycle to prevent
+        desynchronization after a failed operation.
+        """
+        total = 0
+        for peer in self.peers.values():
+            if hasattr(peer, 'flush'):
+                total += peer.flush()
+        if total > 0:
+            logger.info(f"Rank {self.rank} flushed {total} stale messages from peers")
+
     def get_stats(self) -> Dict[str, Any]:
         """Get communication statistics."""
         return self.stats.to_dict()
@@ -387,16 +584,21 @@ class Communicator:
     async def shutdown(self):
         """Shutdown communicator and close all connections."""
         logger.info(f"Rank {self.rank} shutting down communicator")
-        
+
         # Close peer connections
         for peer in self.peers.values():
             await peer.close()
         self.peers.clear()
-        
-        # Stop server
+
+        # Stop TCP server if used
         if self._server:
             await self._server.stop()
-        
+
+        # Close WS relay manager if used
+        if hasattr(self, '_relay_manager') and self._relay_manager:
+            await self._relay_manager.close()
+            self._relay_manager = None
+
         self._initialized = False
         logger.info(f"Rank {self.rank} communicator shutdown complete")
 

@@ -139,17 +139,14 @@ class AllGather:
             send_peer = self.peers[self.send_to]
             recv_peer = self.peers[self.recv_from]
             
-            # Send current partition, receive new one
-            send_task = asyncio.create_task(
-                send_peer.send_tensor(partitions[current_send_idx])
-            )
-            recv_task = asyncio.create_task(recv_peer.recv_tensor())
-            
-            await send_task
-            
             # Compute index of received partition
             recv_idx = (self.rank - step - 1) % n
-            partitions[recv_idx] = await recv_task
+
+            # Send current partition, receive new one simultaneously
+            _, partitions[recv_idx] = await asyncio.gather(
+                send_peer.send_tensor(partitions[current_send_idx]),
+                recv_peer.recv_tensor(),
+            )
             
             bytes_transferred += (
                 partitions[current_send_idx].nbytes +
@@ -242,11 +239,10 @@ class ReduceScatter:
             send_peer = self.peers[self.send_to]
             recv_peer = self.peers[self.recv_from]
             
-            send_task = asyncio.create_task(send_peer.send_tensor(partitions[send_idx]))
-            recv_task = asyncio.create_task(recv_peer.recv_tensor())
-            
-            await send_task
-            received = await recv_task
+            _, received = await asyncio.gather(
+                send_peer.send_tensor(partitions[send_idx]),
+                recv_peer.recv_tensor(),
+            )
             
             bytes_transferred += partitions[send_idx].nbytes + received.nbytes
             

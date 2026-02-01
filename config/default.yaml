@@ -3,12 +3,16 @@
 
 coordinator:
   host: "0.0.0.0"
-  port: 8080
-  heartbeat_interval_seconds: 5
-  heartbeat_timeout_seconds: 15
-  tokenizer_path: "./model_cache_mlx_Llama_3b_Instruct_4bit"  # Enable /api/inference/text
+  port: 8000                      # Changed from 8080 to match COMMUNICATION_OUTLINE
+  public_host: "127.0.0.1"        # Public address for DHT peer strings
+  dht_port: 31337                 # DHT bootstrap port
+  heartbeat_interval_seconds: 30  # Changed from 5 to match COMMUNICATION_OUTLINE
+  heartbeat_timeout_seconds: 60   # Changed from 15 to match COMMUNICATION_OUTLINE
+  stale_cleanup_interval: 30      # Background cleanup loop interval
+  tokenizer_path: "./model_cache_mlx_Llama_3b_Instruct_4bit"  # Enable /inference/text
 
 worker:
+  transport: "ws_relay"  # Options: "tcp" (direct peer-to-peer), "ws_relay" (relay via coordinator)
   collective_port_base: 9000  # Worker N uses port 9000 + N for peer connections
   collective_timeout_seconds: 30
   buffer_size: 1048576  # 1MB buffer for network operations
@@ -106,7 +110,7 @@ model:
   # rms_norm_eps: 1e-5
 
 serialization:
-  compression_enabled: true
+  compression_enabled: false  # Disabled: float tensors have high entropy, zlib wastes CPU with minimal savings
   compression_threshold_bytes: 1048576  # 1MB - compress tensors larger than this
 
 logging:
