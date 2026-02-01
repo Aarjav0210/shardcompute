@@ -948,6 +948,38 @@ class Embedding:
             embeddings = mx.take(self.weight, flat_ids, axis=0)
             return embeddings.reshape(batch_size, seq_len, self.embedding_dim)
 
+    def compute_lm_head(self, hidden_states: mx.array) -> mx.array:
+        """
+        Compute lm_head logits using embedding weights (for tied embeddings).
+
+        For non-quantized embeddings: hidden_states @ weight.T
+        For quantized embeddings: uses quantized_matmul
+
+        Args:
+            hidden_states: [batch, seq, hidden_size]
+
+        Returns:
+            logits: [batch, seq, vocab_size]
+        """
+        if self.weight is None:
+            raise RuntimeError("Embedding weights not loaded")
+
+        if self.is_quantized:
+            # Use quantized_matmul with transpose=True
+            # Weight is [vocab_size, hidden_size_packed]
+            # This computes hidden_states @ weight^T = [batch, seq, vocab_size]
+            return mx.quantized_matmul(
+                hidden_states,
+                self.weight,
+                self.scales,
+                self.biases,
+                transpose=True,
+                group_size=self.group_size,
+                bits=self.bits,
+            )
+        else:
+            return hidden_states @ self.weight.T
+
     @property
     def num_parameters(self) -> int:
         return self.vocab_size * self.embedding_dim
@@ -1100,7 +1132,8 @@ class PipelineParallelTransformer:
         if self.has_lm_head:
             hidden_states = self.norm(hidden_states)
             if self.tie_word_embeddings and self.embed_tokens is not None:
-                logits = hidden_states @ self.embed_tokens.weight.T
+                # Use compute_lm_head to handle both quantized and non-quantized embeddings
+                logits = self.embed_tokens.compute_lm_head(hidden_states)
             elif self.lm_head is not None:
                 logits = self.lm_head(hidden_states)
             else:
