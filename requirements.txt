@@ -1,4 +1,4 @@
-# Core ML framework for Apple Silicon
+# Core ML framework for Apple Silicon (workers only)
 mlx>=0.12.0
 
 # Numerical computing
