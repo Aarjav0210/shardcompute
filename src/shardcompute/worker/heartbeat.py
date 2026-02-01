@@ -12,11 +12,16 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class HeartbeatConfig:
-    """Configuration for heartbeat client."""
-    
-    interval_seconds: float = 5.0
+    """Configuration for heartbeat client.
+
+    Default timing matches COMMUNICATION_OUTLINE.md:
+    - 30s heartbeat interval
+    - 2 consecutive failures allowed (60s total timeout)
+    """
+
+    interval_seconds: float = 30.0  # Changed from 5.0 to match COMMUNICATION_OUTLINE
     timeout_seconds: float = 10.0
-    max_failures: int = 3
+    max_failures: int = 2  # 2 failures * 30s = 60s timeout
 
 
 class HeartbeatClient:
@@ -109,9 +114,12 @@ class HeartbeatClient:
             await asyncio.sleep(self.config.interval_seconds)
     
     async def _send_heartbeat(self):
-        """Send a single heartbeat."""
-        url = f"{self.coordinator_url}/api/heartbeat"
-        
+        """Send a single heartbeat.
+
+        Uses the endpoint structure from COMMUNICATION_OUTLINE.md.
+        """
+        url = f"{self.coordinator_url}/workers/heartbeat"
+
         # Collect metrics if callback provided
         metrics = {}
         if self.metrics_callback:
@@ -119,11 +127,13 @@ class HeartbeatClient:
                 metrics = self.metrics_callback()
             except Exception as e:
                 logger.warning(f"Failed to collect metrics: {e}")
-        
+
+        # Payload matches COMMUNICATION_OUTLINE.md WorkerHeartbeat model
         payload = {
+            "worker_id": f"worker-{self.rank}",
             "rank": self.rank,
             "status": self.status,
-            "timestamp": time.time(),
+            "tokens_served_since_last": metrics.get("tokens_served", 0),
             "metrics": metrics,
         }
         

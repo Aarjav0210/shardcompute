@@ -75,7 +75,8 @@ const appendToMessage = (messageWrapper, text) => {
 
 const refreshStatus = async () => {
   try {
-    const response = await fetch("/api/status");
+    // Use root endpoint with JSON query param (matches COMMUNICATION_OUTLINE.md style)
+    const response = await fetch("/?json=1");
     if (!response.ok) {
       throw new Error("Status unavailable");
     }
@@ -99,7 +100,8 @@ const refreshStatus = async () => {
 
 const refreshMetrics = async () => {
   try {
-    const response = await fetch("/api/metrics");
+    // Use /metrics endpoint (no /api prefix, matches COMMUNICATION_OUTLINE.md style)
+    const response = await fetch("/metrics");
     if (!response.ok) {
       throw new Error("Metrics unavailable");
     }
@@ -148,7 +150,8 @@ const sendPrompt = async (prompt) => {
   let fullText = "";
 
   try {
-    const response = await fetch("/api/inference/text/stream", {
+    // Use /inference/text/stream endpoint (no /api prefix, matches COMMUNICATION_OUTLINE.md style)
+    const response = await fetch("/inference/text/stream", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify(payload),

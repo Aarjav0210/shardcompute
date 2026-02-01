@@ -130,35 +130,45 @@ class WorkerNode:
             await self.stop()
     
     async def _register_with_coordinator(self):
-        """Register this worker with the coordinator."""
-        url = f"{self.coordinator_url}/api/workers/register"
-        
+        """Register this worker with the coordinator.
+
+        Uses the endpoint structure from COMMUNICATION_OUTLINE.md.
+        """
+        url = f"{self.coordinator_url}/workers/register"
+
         payload = {
+            "worker_id": f"worker-{self.rank}",
             "rank": self.rank,
             "host": self.host,
             "port": self.collective_port,
             "collective_port": self.collective_port,
+            "hardware_type": "apple_silicon",
             "device_info": {
                 "platform": "apple_silicon",
                 "mlx_version": mx.__version__ if hasattr(mx, '__version__') else "unknown",
             },
         }
-        
+
         logger.info(f"Rank {self.rank} registering with coordinator")
-        
+
         async with self._http_session.post(url, json=payload) as response:
             if response.status != 200:
                 error = await response.text()
                 raise RuntimeError(f"Registration failed: {error}")
-            
+
             data = await response.json()
             self._world_size = data.get("world_size", self._world_size)
-            
+
+            # Log initial_peers if available (multiaddr format)
+            initial_peers = data.get("initial_peers", [])
+            if initial_peers:
+                logger.debug(f"Rank {self.rank} received initial_peers: {initial_peers}")
+
         logger.info(f"Rank {self.rank} registered successfully, world_size={self._world_size}")
     
     async def _wait_for_cluster(self) -> List[WorkerInfo]:
         """Wait for all workers to register and get peer list."""
-        url = f"{self.coordinator_url}/api/workers/list"
+        url = f"{self.coordinator_url}/workers"
         
         logger.info(f"Rank {self.rank} waiting for cluster formation")
         
@@ -328,7 +338,7 @@ class WorkerNode:
     
     async def _inference_loop(self):
         """Main loop for rank 0 - receive and process inference requests."""
-        url = f"{self.coordinator_url}/api/inference/poll"
+        url = f"{self.coordinator_url}/inference/poll"
         
         logger.info(f"Rank 0 starting inference loop")
         
@@ -508,7 +518,7 @@ class WorkerNode:
     
     async def _send_response(self, response: InferenceResponse):
         """Send inference response to coordinator."""
-        url = f"{self.coordinator_url}/api/inference/response"
+        url = f"{self.coordinator_url}/inference/response"
 
         async with self._http_session.post(url, json=response.to_dict()) as resp:
             if resp.status != 200:
@@ -516,7 +526,7 @@ class WorkerNode:
 
     async def _send_streaming_token(self, token: StreamingToken):
         """Send a streaming token to coordinator."""
-        url = f"{self.coordinator_url}/api/inference/stream/token"
+        url = f"{self.coordinator_url}/inference/stream/token"
 
         try:
             async with self._http_session.post(

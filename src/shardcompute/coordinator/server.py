@@ -1,10 +1,17 @@
-"""Coordinator server for cluster management."""
+"""Coordinator server for cluster management.
+
+This coordinator follows the communication style defined in COMMUNICATION_OUTLINE.md:
+- REST API without /api prefix
+- DHT bootstrap with multiaddr peer format
+- 30s heartbeat interval, 60s timeout
+"""
 
 import asyncio
 import logging
 import signal
 import argparse
 import uuid
+import time
 from typing import Dict, Any, Optional, List
 from pathlib import Path
 import yaml
@@ -13,6 +20,7 @@ from aiohttp import web
 from shardcompute.coordinator.registry import WorkerRegistry, RegistryConfig
 from shardcompute.coordinator.health import HealthMonitor, HealthConfig
 from shardcompute.coordinator.metrics import MetricsAggregator
+from shardcompute.coordinator.dht_bootstrap import SimpleDHT, DHTConfig
 from shardcompute.protocol.messages import WorkerInfo, InferenceRequest, InferenceResponse, StreamingToken
 
 logger = logging.getLogger(__name__)
@@ -51,12 +59,12 @@ class CoordinatorServer:
     def __init__(
         self,
         host: str = "0.0.0.0",
-        port: int = 8080,
+        port: int = 8000,  # Changed from 8080 to match COMMUNICATION_OUTLINE
         config_path: Optional[str] = None,
     ):
         """
         Initialize CoordinatorServer.
-        
+
         Args:
             host: Host to bind to
             port: Port to listen on
@@ -64,29 +72,44 @@ class CoordinatorServer:
         """
         self.host = host
         self.port = port
-        
+
         # Load configuration
         self.config = self._load_config(config_path)
-        
+
         # Setup components
         world_size = self.config.get("parallelism", {}).get("tensor_parallel_size", 2)
-        heartbeat_timeout = self.config.get("coordinator", {}).get("heartbeat_timeout_seconds", 15)
-        
+        heartbeat_timeout = self.config.get("coordinator", {}).get("heartbeat_timeout_seconds", 60)
+
         registry_config = RegistryConfig(expected_workers=world_size)
         self.registry = WorkerRegistry(registry_config)
-        
+
         health_config = HealthConfig(heartbeat_timeout=heartbeat_timeout)
         self.health_monitor = HealthMonitor(
             self.registry,
             health_config,
             on_failure=self._handle_worker_failure,
         )
-        
+
         self.metrics = MetricsAggregator()
+
+        # DHT bootstrap for peer discovery (COMMUNICATION_OUTLINE style)
+        coordinator_config = self.config.get("coordinator", {})
+        dht_config = DHTConfig(
+            public_host=coordinator_config.get("public_host", "127.0.0.1"),
+            dht_port=coordinator_config.get("dht_port", 31337),
+            stale_timeout_seconds=120.0,
+            cleanup_interval_seconds=coordinator_config.get("stale_cleanup_interval", 30),
+        )
+        self.dht = SimpleDHT(dht_config)
+
+        # User and usage tracking (minimal implementation)
+        self._users: Dict[str, Dict[str, Any]] = {}
+        self._usage_log: List[Dict[str, Any]] = []
+        self._start_time = time.time()
 
         # Optional tokenizer for text UI
         self.tokenizer = self._load_tokenizer()
-        
+
         # Inference queue
         self._pending_requests: asyncio.Queue = asyncio.Queue()
         self._completed_requests: Dict[str, InferenceResponse] = {}
@@ -97,17 +120,17 @@ class CoordinatorServer:
 
         # Track input lengths for metric calculation
         self._request_input_lengths: Dict[str, int] = {}
-        
+
         # HTTP app
         self.app = web.Application()
         self._static_path = Path(__file__).parent / "static"
         self._index_path = self._static_path / "index.html"
         self._setup_routes()
-        
+
         # State
         self._running = False
         self._runner: Optional[web.AppRunner] = None
-        
+
         logger.info(f"Coordinator initialized: {host}:{port}, world_size={world_size}")
     
     def _load_config(self, config_path: Optional[str]) -> Dict[str, Any]:
@@ -118,70 +141,101 @@ class CoordinatorServer:
         return {}
     
     def _setup_routes(self):
-        """Setup HTTP routes."""
+        """Setup HTTP routes.
+
+        Endpoint structure follows COMMUNICATION_OUTLINE.md:
+        - No /api prefix
+        - /network/* for network info, health, stats
+        - /workers/* for worker management
+        - /inference/* for inference
+        - /users/* and /usage/* for tracking
+        """
+        # Root and dashboard
+        self.app.router.add_get("/", self._handle_root)
+        self.app.router.add_get("/dashboard", self._handle_dashboard)
+        self.app.router.add_get("/ui", self._handle_ui)
+
+        # Network info (COMMUNICATION_OUTLINE style)
+        self.app.router.add_get("/network/info", self._handle_network_info)
+        self.app.router.add_get("/network/health", self._handle_health)
+        self.app.router.add_get("/network/stats", self._handle_network_stats)
+
         # Worker management
-        self.app.router.add_post("/api/workers/register", self._handle_register)
-        self.app.router.add_get("/api/workers/list", self._handle_list_workers)
-        self.app.router.add_post("/api/heartbeat", self._handle_heartbeat)
+        self.app.router.add_post("/workers/register", self._handle_register)
+        self.app.router.add_get("/workers", self._handle_list_workers)
+        self.app.router.add_post("/workers/heartbeat", self._handle_heartbeat)
+        self.app.router.add_delete("/workers/{worker_id}", self._handle_unregister)
 
         # Inference
-        self.app.router.add_post("/api/inference", self._handle_inference)
-        self.app.router.add_post("/api/inference/text", self._handle_inference_text)
-        self.app.router.add_post("/api/inference/text/stream", self._handle_inference_text_stream)
-        self.app.router.add_get("/api/inference/poll", self._handle_poll)
-        self.app.router.add_post("/api/inference/response", self._handle_response)
-        self.app.router.add_post("/api/inference/stream/token", self._handle_streaming_token)
-        self.app.router.add_get("/api/inference/{request_id}", self._handle_get_result)
-        
-        # Metrics and status
-        self.app.router.add_get("/api/status", self._handle_status)
-        self.app.router.add_get("/api/metrics", self._handle_metrics)
-        self.app.router.add_get("/api/health", self._handle_health)
+        self.app.router.add_post("/inference", self._handle_inference)
+        self.app.router.add_post("/inference/text", self._handle_inference_text)
+        self.app.router.add_post("/inference/text/stream", self._handle_inference_text_stream)
+        self.app.router.add_get("/inference/poll", self._handle_poll)
+        self.app.router.add_post("/inference/response", self._handle_response)
+        self.app.router.add_post("/inference/stream/token", self._handle_streaming_token)
+        self.app.router.add_get("/inference/{request_id}", self._handle_get_result)
 
-        # Root
-        self.app.router.add_get("/", self._handle_root)
-        self.app.router.add_get("/ui", self._handle_ui)
+        # Metrics
+        self.app.router.add_get("/metrics", self._handle_metrics)
+
+        # User management (minimal)
+        self.app.router.add_post("/users/register", self._handle_user_register)
+        self.app.router.add_get("/users/{user_id}", self._handle_get_user)
+
+        # Usage tracking (minimal)
+        self.app.router.add_post("/usage/log", self._handle_usage_log)
+        self.app.router.add_get("/usage/recent", self._handle_usage_recent)
+
+        # Static files
         if self._static_path.exists():
             self.app.router.add_static("/static", self._static_path)
     
     async def start(self):
         """Start the coordinator server."""
         logger.info(f"Starting coordinator server on {self.host}:{self.port}")
-        
+
         self._running = True
-        
+        self._start_time = time.time()
+
+        # Start DHT bootstrap
+        await self.dht.start()
+
         # Start health monitor
         await self.health_monitor.start()
-        
+
         # Start HTTP server
         self._runner = web.AppRunner(self.app)
         await self._runner.setup()
-        
+
         site = web.TCPSite(self._runner, self.host, self.port)
         await site.start()
-        
+
         logger.info(f"Coordinator server started on http://{self.host}:{self.port}")
-        
+        logger.info(f"Dashboard available at http://{self.host}:{self.port}/dashboard")
+
         # Wait for cluster
         logger.info("Waiting for workers to register...")
         ready = await self.registry.wait_for_cluster()
-        
+
         if ready:
             logger.info("Cluster is ready for inference")
         else:
             logger.warning("Cluster formation timed out")
-    
+
     async def stop(self):
         """Stop the coordinator server."""
         logger.info("Stopping coordinator server")
-        
+
         self._running = False
-        
+
+        # Stop DHT
+        await self.dht.stop()
+
         await self.health_monitor.stop()
-        
+
         if self._runner:
             await self._runner.cleanup()
-        
+
         logger.info("Coordinator server stopped")
     
     def _handle_worker_failure(self, rank: int):
@@ -195,7 +249,10 @@ class CoordinatorServer:
     # === HTTP Handlers ===
     
     async def _handle_root(self, request: web.Request) -> web.Response:
-        """Handle root endpoint."""
+        """Handle root endpoint (GET /).
+
+        Returns complete status info for dashboard when JSON is requested.
+        """
         accept = request.headers.get("Accept", "")
         wants_json = "application/json" in accept or request.query.get("json") == "1"
         if wants_json:
@@ -203,7 +260,9 @@ class CoordinatorServer:
                 "service": "ShardCompute Coordinator",
                 "status": "running" if self._running else "stopped",
                 "cluster_ready": self.registry.is_cluster_ready,
+                "cluster_healthy": self.health_monitor.is_cluster_healthy(),
                 "workers": self.registry.worker_count,
+                "expected_workers": self.registry.config.expected_workers,
             })
         return await self._handle_ui(request)
 
@@ -214,25 +273,59 @@ class CoordinatorServer:
         return web.Response(text="UI assets not found", status=404)
     
     async def _handle_register(self, request: web.Request) -> web.Response:
-        """Handle worker registration."""
+        """Handle worker registration.
+
+        Returns LayerAssignment response with initial_peers in multiaddr format,
+        following COMMUNICATION_OUTLINE.md style.
+        """
         try:
             data = await request.json()
-            
+
+            # Support both old and new field names
+            rank = data.get("rank", 0)
+            host = data.get("host", request.remote or "127.0.0.1")
+            port = data.get("port", 9000)
+            collective_port = data.get("collective_port", port)
+            worker_id = data.get("worker_id", f"worker-{rank}")
+
             info = WorkerInfo(
-                rank=data["rank"],
-                host=data["host"],
-                port=data["port"],
-                collective_port=data.get("collective_port", data["port"]),
+                rank=rank,
+                host=host,
+                port=port,
+                collective_port=collective_port,
                 device_info=data.get("device_info", {}),
             )
-            
+
             success = await self.registry.register(info)
-            
+
             if success:
+                # Register peer in DHT with multiaddr format
+                peer_id = self.dht.generate_peer_id(rank)
+                await self.dht.register_peer(
+                    peer_id=peer_id,
+                    address=host,
+                    port=collective_port,
+                    rank=rank,
+                    metadata={"worker_id": worker_id, "device_info": info.device_info},
+                )
+
+                # Get model info for response
+                model_config = self.config.get("model", {})
+                model_name = model_config.get("name", "unknown")
+                total_layers = model_config.get("num_layers", 0)
+
+                # For tensor parallelism, all workers get all layers
+                # (different from Petals which assigns layer ranges)
                 return web.json_response({
-                    "status": "registered",
-                    "rank": info.rank,
+                    "status": "online",  # Auto-approved
+                    "worker_id": worker_id,
+                    "rank": rank,
                     "world_size": self.registry.config.expected_workers,
+                    "layers_start": 0,
+                    "layers_end": total_layers,
+                    "model_name": model_name,
+                    "initial_peers": self.dht.get_initial_peers(),
+                    "is_idle": False,
                 })
             else:
                 return web.json_response(
@@ -244,29 +337,80 @@ class CoordinatorServer:
             return web.json_response({"error": str(e)}, status=500)
     
     async def _handle_list_workers(self, request: web.Request) -> web.Response:
-        """Handle worker list request."""
+        """Handle worker list request (GET /workers)."""
         return web.json_response({
             "workers": self.registry.get_workers_dict(),
             "cluster_ready": self.registry.is_cluster_ready,
         })
-    
+
     async def _handle_heartbeat(self, request: web.Request) -> web.Response:
-        """Handle worker heartbeat."""
+        """Handle worker heartbeat (POST /workers/heartbeat).
+
+        Updates both registry and DHT, following COMMUNICATION_OUTLINE.md style.
+        """
         try:
             data = await request.json()
-            rank = data["rank"]
-            status = data.get("status", "unknown")
+            # Support both old (rank) and new (worker_id) field names
+            rank = data.get("rank")
+            worker_id = data.get("worker_id")
+            status = data.get("status", "online")
             metrics = data.get("metrics", {})
-            
-            await self.registry.update_heartbeat(rank, status)
-            self.health_monitor.record_heartbeat(rank)
-            
-            if metrics:
-                self.metrics.record_worker_metrics(rank, metrics)
-            
-            return web.json_response({"status": "ok"})
+            tokens_served = data.get("tokens_served_since_last", 0)
+
+            if rank is None and worker_id:
+                # Try to find rank from worker_id
+                for r, worker in self.registry.get_workers_dict().items():
+                    if worker.get("worker_id") == worker_id:
+                        rank = int(r)
+                        break
+
+            if rank is not None:
+                await self.registry.update_heartbeat(rank, status)
+                self.health_monitor.record_heartbeat(rank)
+
+                # Update DHT heartbeat
+                await self.dht.heartbeat_by_rank(rank)
+
+                if metrics:
+                    self.metrics.record_worker_metrics(rank, metrics)
+
+            # Return worker status and layer info
+            model_config = self.config.get("model", {})
+            return web.json_response({
+                "status": "ok",
+                "worker_status": "online",
+                "layers_start": 0,
+                "layers_end": model_config.get("num_layers", 0),
+            })
         except Exception as e:
             logger.error(f"Heartbeat error: {e}")
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_unregister(self, request: web.Request) -> web.Response:
+        """Handle worker unregistration (DELETE /workers/{worker_id})."""
+        try:
+            worker_id = request.match_info["worker_id"]
+
+            # Find and remove worker by ID or rank
+            rank = None
+            try:
+                rank = int(worker_id)
+            except ValueError:
+                # Try to find rank from worker_id
+                for r, worker in self.registry.get_workers_dict().items():
+                    if worker.get("worker_id") == worker_id:
+                        rank = int(r)
+                        break
+
+            if rank is not None:
+                await self.registry.deregister(rank)
+                await self.dht.remove_peer_by_rank(rank)
+                logger.info(f"Worker {worker_id} (rank {rank}) unregistered")
+                return web.json_response({"status": "ok"})
+            else:
+                return web.json_response({"error": "Worker not found"}, status=404)
+        except Exception as e:
+            logger.error(f"Unregister error: {e}")
             return web.json_response({"error": str(e)}, status=500)
     
     async def _handle_inference(self, request: web.Request) -> web.Response:
@@ -567,12 +711,115 @@ class CoordinatorServer:
         return web.json_response(self.metrics.get_full_report())
     
     async def _handle_health(self, request: web.Request) -> web.Response:
-        """Handle health check request."""
+        """Handle health check request (GET /network/health)."""
         health = self.health_monitor.get_health_status()
-        
+
         status = 200 if self.health_monitor.is_cluster_healthy() else 503
-        
+
         return web.json_response(health, status=status)
+
+    async def _handle_network_info(self, request: web.Request) -> web.Response:
+        """Handle network info request (GET /network/info).
+
+        Returns bootstrap_peers in multiaddr format, following COMMUNICATION_OUTLINE.md.
+        """
+        model_config = self.config.get("model", {})
+        model_name = model_config.get("name", "unknown")
+        total_layers = model_config.get("num_layers", 0)
+        quantization_config = self.config.get("quantization", {})
+
+        return web.json_response({
+            "model_name": model_name,
+            "total_layers": total_layers,
+            "bootstrap_peers": self.dht.get_initial_peers(),
+            "online_workers": self.registry.worker_count,
+            "coverage_percent": 100.0 if self.registry.is_cluster_ready else 0.0,
+            "ready_for_inference": (
+                self.registry.is_cluster_ready and
+                self.health_monitor.is_cluster_healthy()
+            ),
+            "quantization_mode": quantization_config.get("mode"),
+        })
+
+    async def _handle_network_stats(self, request: web.Request) -> web.Response:
+        """Handle network stats request (GET /network/stats)."""
+        summary = self.metrics.get_summary()
+        uptime = time.time() - self._start_time
+
+        return web.json_response({
+            "uptime_seconds": uptime,
+            "total_requests": summary.get("total_requests", 0),
+            "total_tokens_generated": summary.get("total_tokens_generated", 0),
+            "avg_latency_ms": summary.get("avg_latency_ms", 0),
+            "p99_latency_ms": summary.get("p99_latency_ms", 0),
+            "avg_throughput_tokens_per_sec": summary.get("avg_throughput_tokens_per_sec", 0),
+            "coverage_percent": 100.0 if self.registry.is_cluster_ready else 0.0,
+        })
+
+    async def _handle_dashboard(self, request: web.Request) -> web.Response:
+        """Handle dashboard request (GET /dashboard)."""
+        if self._index_path.exists():
+            return web.FileResponse(self._index_path)
+        return web.Response(text="Dashboard not found", status=404)
+
+    async def _handle_user_register(self, request: web.Request) -> web.Response:
+        """Handle user registration (POST /users/register)."""
+        try:
+            data = await request.json()
+            user_id = data.get("user_id")
+            if not user_id:
+                return web.json_response({"error": "user_id required"}, status=400)
+
+            self._users[user_id] = {
+                "user_id": user_id,
+                "display_name": data.get("display_name"),
+                "total_prompts": 0,
+                "total_tokens": 0,
+                "created_at": time.time(),
+            }
+            return web.json_response({"status": "ok", "user_id": user_id})
+        except Exception as e:
+            logger.error(f"User registration error: {e}")
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_get_user(self, request: web.Request) -> web.Response:
+        """Handle get user request (GET /users/{user_id})."""
+        user_id = request.match_info["user_id"]
+        if user_id not in self._users:
+            return web.json_response({"error": "User not found"}, status=404)
+        return web.json_response(self._users[user_id])
+
+    async def _handle_usage_log(self, request: web.Request) -> web.Response:
+        """Handle usage log request (POST /usage/log)."""
+        try:
+            data = await request.json()
+            entry = {
+                "user_id": data.get("user_id"),
+                "prompt_tokens": data.get("prompt_tokens", 0),
+                "completion_tokens": data.get("completion_tokens", 0),
+                "worker_ids": data.get("worker_ids", []),
+                "timestamp": time.time(),
+            }
+            self._usage_log.append(entry)
+
+            # Update user stats if user exists
+            user_id = entry["user_id"]
+            if user_id and user_id in self._users:
+                self._users[user_id]["total_prompts"] += 1
+                self._users[user_id]["total_tokens"] += (
+                    entry["prompt_tokens"] + entry["completion_tokens"]
+                )
+
+            return web.json_response({"status": "ok"})
+        except Exception as e:
+            logger.error(f"Usage log error: {e}")
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_usage_recent(self, request: web.Request) -> web.Response:
+        """Handle recent usage request (GET /usage/recent)."""
+        limit = int(request.query.get("limit", 15))
+        recent = self._usage_log[-limit:] if self._usage_log else []
+        return web.json_response({"entries": recent})
 
     def _load_tokenizer(self):
         """Load tokenizer if configured."""
@@ -716,7 +963,7 @@ def main():
     """Entry point for coordinator server."""
     parser = argparse.ArgumentParser(description="ShardCompute Coordinator")
     parser.add_argument("--host", type=str, default="0.0.0.0", help="Host to bind to")
-    parser.add_argument("--port", type=int, default=8080, help="Port to listen on")
+    parser.add_argument("--port", type=int, default=8000, help="Port to listen on")
     parser.add_argument("--config", type=str, help="Path to config file")
     parser.add_argument("--log-level", type=str, default="INFO", help="Logging level")
     
