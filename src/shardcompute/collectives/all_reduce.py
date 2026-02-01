@@ -155,11 +155,10 @@ class RingAllReduce:
             recv_peer = self.peers[self.recv_from]
             
             # Send and receive simultaneously
-            send_task = asyncio.create_task(send_peer.send_tensor(chunks[send_idx]))
-            recv_task = asyncio.create_task(recv_peer.recv_tensor())
-            
-            await send_task
-            received = await recv_task
+            _, received = await asyncio.gather(
+                send_peer.send_tensor(chunks[send_idx]),
+                recv_peer.recv_tensor(),
+            )
             
             bytes_transferred += chunks[send_idx].nbytes + received.nbytes
             
@@ -176,11 +175,10 @@ class RingAllReduce:
             recv_peer = self.peers[self.recv_from]
             
             # Exchange
-            send_task = asyncio.create_task(send_peer.send_tensor(chunks[send_idx]))
-            recv_task = asyncio.create_task(recv_peer.recv_tensor())
-            
-            await send_task
-            chunks[recv_idx] = await recv_task
+            _, chunks[recv_idx] = await asyncio.gather(
+                send_peer.send_tensor(chunks[send_idx]),
+                recv_peer.recv_tensor(),
+            )
             
             bytes_transferred += chunks[send_idx].nbytes + chunks[recv_idx].nbytes
         

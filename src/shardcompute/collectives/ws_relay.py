@@ -82,10 +82,10 @@ class WebSocketRelayConnection:
         return tensor
 
     async def send_recv_tensor(self, send_tensor: mx.array) -> mx.array:
-        send_task = asyncio.create_task(self.send_tensor(send_tensor))
-        recv_task = asyncio.create_task(self.recv_tensor())
-        await send_task
-        recv_tensor = await recv_task
+        _, recv_tensor = await asyncio.gather(
+            self.send_tensor(send_tensor),
+            self.recv_tensor(),
+        )
         return recv_tensor
 
     def flush(self):

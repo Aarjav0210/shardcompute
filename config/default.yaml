@@ -110,7 +110,7 @@ model:
   # rms_norm_eps: 1e-5
 
 serialization:
-  compression_enabled: true
+  compression_enabled: false  # Disabled: float tensors have high entropy, zlib wastes CPU with minimal savings
   compression_threshold_bytes: 1048576  # 1MB - compress tensors larger than this
 
 logging:

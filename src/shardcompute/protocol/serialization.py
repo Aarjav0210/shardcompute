@@ -61,9 +61,9 @@ class TensorSerializer:
     
     def __init__(
         self,
-        compression_enabled: bool = True,
+        compression_enabled: bool = False,
         compression_threshold: int = COMPRESSION_THRESHOLD,
-        compression_level: int = 6,
+        compression_level: int = 1,
     ):
         self.compression_enabled = compression_enabled
         self.compression_threshold = compression_threshold
@@ -79,10 +79,9 @@ class TensorSerializer:
         Returns:
             Serialized bytes including metadata and tensor data
         """
-        # Ensure tensor is evaluated
-        mx.eval(tensor)
-        
         # Convert to numpy for serialization
+        # Note: mx.eval() is NOT called here -- callers (collectives) already
+        # evaluate before entering the serialization path.
         np_array = self._mlx_to_numpy(tensor)
         tensor_bytes = np_array.tobytes()
         
@@ -162,9 +161,10 @@ class TensorSerializer:
         # Handle bfloat16 specially - convert to float32
         if tensor.dtype == mx.bfloat16:
             tensor = tensor.astype(mx.float32)
-        
+
+        # Use np.asarray for potential zero-copy when memory layout permits
         np_dtype = MLX_TO_NUMPY_DTYPE.get(tensor.dtype, np.float32)
-        return np.array(tensor, dtype=np_dtype)
+        return np.asarray(tensor, dtype=np_dtype)
     
     def _get_numpy_dtype(self, dtype_str: str) -> np.dtype:
         """Get numpy dtype from string."""
