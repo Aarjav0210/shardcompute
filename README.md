@@ -139,8 +139,24 @@ python scripts/benchmark.py \
 
 ### Web UI
 
-Open `http://localhost:8080` in a browser to use the Metropolis console. For
-text prompts, set `coordinator.tokenizer_path` in `config/default.yaml` to a
+The UI is now a React/Vite app in `ui/`. Build it to `src/shardcompute/coordinator/static`
+and then open `http://localhost:8080` in a browser.
+
+```bash
+cd ui
+npm install
+npm run build
+```
+
+For local UI development:
+
+```bash
+cd ui
+npm install
+npm run dev
+```
+
+For text prompts, set `coordinator.tokenizer_path` in `config/default.yaml` to a
 local tokenizer folder or model id.
 
 ## Project Structure
