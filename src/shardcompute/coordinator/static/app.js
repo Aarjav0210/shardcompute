@@ -1,15 +1,13 @@
 const statusBadge = document.getElementById("status-badge");
 const healthChip = document.getElementById("health-chip");
-const statusValue = document.getElementById("status-value");
-const workersValue = document.getElementById("workers-value");
-const expectedValue = document.getElementById("expected-value");
-const latencyValue = document.getElementById("latency-value");
+const workersOkEl = document.getElementById("workers-ok");
+const workersMissEl = document.getElementById("workers-miss");
 const throughputValue = document.getElementById("throughput-value");
-const requestsValue = document.getElementById("requests-value");
 const statusHint = document.getElementById("status-hint");
 const messagesEl = document.getElementById("messages");
 const feedChip = document.getElementById("feed-chip");
 const feedHint = document.getElementById("feed-hint");
+const togglePanelsBtn = document.getElementById("toggle-panels");
 const tokenChart = document.getElementById("token-chart");
 const tokensPerSecEl = document.getElementById("tokens-per-sec");
 
@@ -89,16 +87,27 @@ const refreshStatus = async () => {
     }
     const data = await response.json();
 
-    statusValue.textContent = data.status || "unknown";
-    workersValue.textContent = data.workers ?? "--";
-    expectedValue.textContent = data.expected_workers ?? "--";
+    const workers = data.workers ?? 0;
+    const expected = data.expected_workers ?? 0;
+    if (workersOkEl) {
+      workersOkEl.textContent = expected ? `${workers}` : "--";
+    }
+    if (workersMissEl) {
+      const missing = expected ? Math.max(expected - workers, 0) : "--";
+      workersMissEl.textContent = missing === "--" ? "--" : `${missing}`;
+    }
     setBadge(statusBadge, data.cluster_ready, data.cluster_ready ? "linked" : "offline");
     setBadge(healthChip, data.cluster_healthy, data.cluster_healthy ? "healthy" : "degraded");
     statusHint.textContent = data.cluster_ready
       ? "Cluster ready for inference."
       : "Waiting for workers to report in.";
   } catch (error) {
-    statusValue.textContent = "offline";
+    if (workersOkEl) {
+      workersOkEl.textContent = "--";
+    }
+    if (workersMissEl) {
+      workersMissEl.textContent = "--";
+    }
     setBadge(statusBadge, false, "offline");
     setBadge(healthChip, false, "unknown");
     statusHint.textContent = "Coordinator not reachable.";
@@ -115,21 +124,28 @@ const refreshMetrics = async () => {
     const data = await response.json();
     const summary = data.summary || {};
 
-    latencyValue.textContent = `${formatNumber(summary.avg_latency_ms)} ms`;
     const avgThroughput = formatNumber(summary.avg_throughput_tokens_per_sec, 1);
-    const lastThroughput = formatNumber(summary.last_throughput_tokens_per_sec, 1);
-    throughputValue.textContent = `${avgThroughput} tok/s (prev: ${lastThroughput})`;
-    requestsValue.textContent = summary.total_requests ?? "--";
+    if (throughputValue) {
+      throughputValue.textContent = `${avgThroughput} tok/s avg`;
+    }
   } catch (error) {
-    latencyValue.textContent = "--";
-    throughputValue.textContent = "--";
-    requestsValue.textContent = "--";
+    if (throughputValue) {
+      throughputValue.textContent = "-- tok/s avg";
+    }
   }
 };
 
 const updateRanges = () => {
   tempValue.textContent = Number(temperatureInput.value).toFixed(2);
   topPValue.textContent = Number(topPInput.value).toFixed(2);
+};
+
+const updatePanelToggle = () => {
+  if (!togglePanelsBtn) {
+    return;
+  }
+  const collapsed = document.body.classList.contains("panels-collapsed");
+  togglePanelsBtn.textContent = collapsed ? "Show Panels" : "Hide Panels";
 };
 
 const initTokenChart = () => {
@@ -274,7 +290,7 @@ const sendPrompt = async (prompt) => {
     } else {
       addMessage("assistant", error.message, "error");
     }
-    if (error.message.includes("tokenizer")) {
+    if (error.message.includes("tokenizer") && tokenizerNote) {
       tokenizerNote.textContent =
         "Tokenizer missing. Set coordinator.tokenizer_path to enable text inference.";
     }
@@ -304,6 +320,13 @@ sampleBtn.addEventListener("click", () => {
   promptInput.focus();
 });
 
+if (togglePanelsBtn) {
+  togglePanelsBtn.addEventListener("click", () => {
+    document.body.classList.toggle("panels-collapsed");
+    updatePanelToggle();
+  });
+}
+
 clearBtn.addEventListener("click", () => {
   messagesEl.innerHTML = "";
   conversation.length = 0;
@@ -319,6 +342,10 @@ topPInput.addEventListener("input", updateRanges);
 
 updateRanges();
 initTokenChart();
+if (window.innerWidth < 900) {
+  document.body.classList.add("panels-collapsed");
+}
+updatePanelToggle();
 refreshStatus();
 refreshMetrics();
 setInterval(refreshStatus, 5000);
@@ -329,7 +356,9 @@ setInterval(() => {
   if (tokenSeries.length > maxSeriesPoints) {
     tokenSeries.shift();
   }
-  tokensPerSecEl.textContent = `${formatNumber(tps, 1)} tok/s`;
+  if (tokensPerSecEl) {
+    tokensPerSecEl.textContent = `${formatNumber(tps, 1)} tok/s live`;
+  }
   updateTokenChart();
   liveTokenCount = 0;
 }, tokenSamplerMs);

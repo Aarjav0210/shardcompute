@@ -40,120 +40,108 @@
             <h2>Cluster Pulse</h2>
             <span class="chip" id="health-chip">checking</span>
           </div>
-          <div class="status-grid">
-            <div>
-              <p class="label">Status</p>
-              <p class="value" id="status-value">--</p>
-            </div>
-            <div>
+                              <div class="status-grid">
+            <div class="metric">
               <p class="label">Workers</p>
-              <p class="value" id="workers-value">--</p>
-            </div>
-            <div>
-              <p class="label">Expected</p>
-              <p class="value" id="expected-value">--</p>
-            </div>
-            <div>
-              <p class="label">Latency (avg)</p>
-              <p class="value" id="latency-value">--</p>
-            </div>
-            <div>
-              <p class="label">Throughput</p>
-              <p class="value" id="throughput-value">--</p>
-            </div>
-            <div>
-              <p class="label">Total Requests</p>
-              <p class="value" id="requests-value">--</p>
+              <div class="worker-dots">
+                <span class="dot dot-ok"></span>
+                <span class="dot-count" id="workers-ok">--</span>
+                <span class="dot dot-miss"></span>
+                <span class="dot-count" id="workers-miss">--</span>
+              </div>
             </div>
           </div>
           <div class="chart">
-            <div class="chart-header">
+                        <div class="chart-header">
               <span class="label">Token Flux</span>
-              <span class="chart-value" id="tokens-per-sec">-- tok/s</span>
+              <div class="chart-meta">
+                <span class="chart-value" id="throughput-value">-- tok/s avg</span>
+                <span class="chart-divider">•</span>
+                <span class="chart-value" id="tokens-per-sec">-- tok/s live</span>
+              </div>
             </div>
             <canvas id="token-chart" height="120"></canvas>
           </div>
           <div class="hint" id="status-hint">Listening for the city grid.</div>
         </section>
 
-        <section class="card control" style="--delay: 0.12s">
+                <section class="card control" style="--delay: 0.12s">
           <div class="card-header">
             <h2>Prompt Launch</h2>
             <span class="chip ghost">text mode</span>
           </div>
-          <form id="prompt-form">
-            <label class="label" for="prompt-input">Command</label>
-            <textarea
-              id="prompt-input"
-              rows="4"
-              placeholder="Draft a prompt for the cluster..."
-            ></textarea>
-            <div class="settings">
-              <div>
-                <label class="label" for="max-tokens">Max tokens</label>
-                <input id="max-tokens" type="number" min="16" max="512" value="160" />
-              </div>
-              <div>
-                <label class="label" for="temperature">
-                  Temperature <span id="temp-value">0.70</span>
-                </label>
-                <input
-                  id="temperature"
-                  type="range"
-                  min="0.1"
-                  max="1.5"
-                  step="0.05"
-                  value="0.7"
-                />
-              </div>
-              <div>
-                <label class="label" for="top-p">
-                  Top P <span id="top-p-value">0.90</span>
-                </label>
-                <input
-                  id="top-p"
-                  type="range"
-                  min="0.1"
-                  max="1.0"
-                  step="0.05"
-                  value="0.9"
-                />
-              </div>
+          <div class="settings">
+            <div>
+              <label class="label" for="max-tokens">Max tokens</label>
+              <input id="max-tokens" type="number" min="16" max="512" value="160" />
             </div>
-            <div class="actions">
-              <button type="submit" id="send-btn">Send to Grid</button>
-              <button type="button" class="ghost" id="sample-btn">
-                Load Sample
-              </button>
+            <div>
+              <label class="label" for="temperature">
+                Temperature <span id="temp-value">0.70</span>
+              </label>
+              <input
+                id="temperature"
+                type="range"
+                min="0.1"
+                max="1.5"
+                step="0.05"
+                value="0.7"
+              />
             </div>
-            <p class="note" id="tokenizer-note">
-              Configure a tokenizer in the coordinator config for best text
-              results.
-            </p>
-          </form>
+            <div>
+              <label class="label" for="top-p">
+                Top P <span id="top-p-value">0.90</span>
+              </label>
+              <input
+                id="top-p"
+                type="range"
+                min="0.1"
+                max="1.0"
+                step="0.05"
+                value="0.9"
+              />
+            </div>
+          </div>
         </section>
 
-        <section class="card stream" style="--delay: 0.2s">
+                <section class="card stream" style="--delay: 0.2s">
           <div class="card-header">
             <h2>City Feed</h2>
-            <span class="chip" id="feed-chip">idle</span>
+            <div class="stream-actions">
+              <span class="chip" id="feed-chip">idle</span>
+              <button class="ghost toggle-panels" id="toggle-panels" type="button">
+                Panels
+              </button>
+            </div>
           </div>
           <div id="messages" class="messages" aria-live="polite"></div>
           <div class="hint" id="feed-hint">
             Responses will appear here once the cluster answers.
           </div>
+                    <form id="prompt-form" class="prompt-dock">
+            <label class="label" for="prompt-input">Command</label>
+            <div class="prompt-row">
+              <textarea
+                id="prompt-input"
+                rows="3"
+                placeholder="Draft a prompt for the cluster..."
+              ></textarea>
+              <div class="prompt-actions">
+                <button type="submit" id="send-btn" class="icon-btn" aria-label="Send">
+                  <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                    <path d="M4 12l16-7-7 16-2.5-6L4 12z" fill="currentColor" />
+                  </svg>
+                </button>
+                <button type="button" class="icon-btn ghost" id="sample-btn" aria-label="Load sample">
+                  <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+                    <path d="M12 3l1.8 5.2L19 10l-5.2 1.8L12 17l-1.8-5.2L5 10l5.2-1.8L12 3z" fill="currentColor" />
+                  </svg>
+                </button>
+              </div>
+            </div>
+          </form>
         </section>
       </main>
-
-      <div class="skyline">
-        <div class="tower"></div>
-        <div class="tower"></div>
-        <div class="tower tall"></div>
-        <div class="tower"></div>
-        <div class="tower wide"></div>
-        <div class="tower"></div>
-        <div class="tower tall"></div>
-      </div>
 
       <footer class="footer">
         <span>ShardCompute UI</span>
