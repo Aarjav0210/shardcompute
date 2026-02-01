@@ -122,14 +122,15 @@ class WorkerInfo:
 @dataclass
 class InferenceRequest:
     """Request for model inference."""
-    
+
     request_id: str
     input_ids: List[int]
     max_new_tokens: int = 100
     temperature: float = 0.7
     top_p: float = 0.9
     stop_tokens: List[int] = field(default_factory=lambda: [2])  # Default EOS token for Llama
-    
+    stream: bool = False  # Whether to stream tokens as they're generated
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
         return {
@@ -139,8 +140,9 @@ class InferenceRequest:
             "temperature": self.temperature,
             "top_p": self.top_p,
             "stop_tokens": self.stop_tokens,
+            "stream": self.stream,
         }
-    
+
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "InferenceRequest":
         """Create from dictionary."""
@@ -151,18 +153,19 @@ class InferenceRequest:
             temperature=data.get("temperature", 0.7),
             top_p=data.get("top_p", 0.9),
             stop_tokens=data.get("stop_tokens", [2]),
+            stream=data.get("stream", False),
         )
 
 
 @dataclass
 class InferenceResponse:
     """Response from model inference."""
-    
+
     request_id: str
     output_ids: List[int]
     timing: Dict[str, float] = field(default_factory=dict)
     error: Optional[str] = None
-    
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
         return {
@@ -171,13 +174,48 @@ class InferenceResponse:
             "timing": self.timing,
             "error": self.error,
         }
-    
+
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "InferenceResponse":
         """Create from dictionary."""
         return cls(
             request_id=data["request_id"],
             output_ids=data["output_ids"],
+            timing=data.get("timing", {}),
+            error=data.get("error"),
+        )
+
+
+@dataclass
+class StreamingToken:
+    """A single token streamed during generation."""
+
+    request_id: str
+    token_id: int
+    token_index: int  # Position in generated sequence
+    is_final: bool = False  # True for the last token
+    timing: Dict[str, float] = field(default_factory=dict)
+    error: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary."""
+        return {
+            "request_id": self.request_id,
+            "token_id": self.token_id,
+            "token_index": self.token_index,
+            "is_final": self.is_final,
+            "timing": self.timing,
+            "error": self.error,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "StreamingToken":
+        """Create from dictionary."""
+        return cls(
+            request_id=data["request_id"],
+            token_id=data["token_id"],
+            token_index=data["token_index"],
+            is_final=data.get("is_final", False),
             timing=data.get("timing", {}),
             error=data.get("error"),
         )

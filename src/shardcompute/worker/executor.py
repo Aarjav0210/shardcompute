@@ -3,12 +3,15 @@
 import asyncio
 import logging
 import time
-from typing import List, Dict, Optional, Any, Tuple
+from typing import List, Dict, Optional, Any, Tuple, Callable, Awaitable
 from dataclasses import dataclass, field
 import mlx.core as mx
 
 from shardcompute.collectives.communicator import Communicator
 from shardcompute.parallel.transformer import ParallelTransformer
+
+# Type alias for token callback: (token_id, token_index, is_final) -> None
+TokenCallback = Callable[[int, int, bool], Awaitable[None]]
 
 logger = logging.getLogger(__name__)
 
@@ -230,39 +233,42 @@ class ParallelExecutor:
         temperature: float = 0.7,
         top_p: float = 0.9,
         stop_tokens: Optional[List[int]] = None,
+        token_callback: Optional[TokenCallback] = None,
     ) -> mx.array:
         """
         Generate tokens autoregressively.
-        
+
         Args:
             input_ids: Initial token IDs [batch, seq_len]
             max_new_tokens: Maximum tokens to generate
             temperature: Sampling temperature
             top_p: Nucleus sampling threshold
             stop_tokens: Token IDs that stop generation
-            
+            token_callback: Optional async callback called for each generated token
+                           with (token_id, token_index, is_final)
+
         Returns:
             Generated token IDs [batch, seq_len + generated]
         """
         if stop_tokens is None:
             stop_tokens = []
-        
+
         # Reset cache
         self._past_key_values = None
-        
+
         # Process prompt
         logits = await self.forward(input_ids, use_cache=True)
-        
+
         generated = []
-        
-        for _ in range(max_new_tokens):
+
+        for token_idx in range(max_new_tokens):
             # Get next token logits (last position)
             next_logits = logits[:, -1, :]  # [batch, vocab]
-            
+
             # Apply temperature
             if temperature > 0:
                 next_logits = next_logits / temperature
-            
+
             # Sample
             if temperature == 0:
                 # Greedy
@@ -270,24 +276,24 @@ class ParallelExecutor:
             else:
                 # Top-p sampling
                 probs = mx.softmax(next_logits, axis=-1)
-                
+
                 # Sort probabilities
                 sorted_indices = mx.argsort(probs, axis=-1)[:, ::-1]
                 sorted_probs = mx.take_along_axis(probs, sorted_indices, axis=-1)
-                
+
                 # Compute cumulative probs
                 cumsum = mx.cumsum(sorted_probs, axis=-1)
-                
+
                 # Mask tokens above top_p
                 mask = cumsum <= top_p
                 mask = mx.concatenate([
                     mx.ones((mask.shape[0], 1), dtype=mx.bool_),
                     mask[:, :-1]
                 ], axis=-1)
-                
+
                 masked_probs = mx.where(mask, sorted_probs, mx.zeros_like(sorted_probs))
                 masked_probs = masked_probs / mx.sum(masked_probs, axis=-1, keepdims=True)
-                
+
                 # Sample from masked distribution
                 next_token_idx = mx.random.categorical(mx.log(masked_probs + 1e-10))
                 next_token = mx.take_along_axis(
@@ -295,25 +301,33 @@ class ParallelExecutor:
                     next_token_idx[:, None],
                     axis=-1
                 )[:, 0]
-            
+
             mx.eval(next_token)
+            token_id = int(next_token[0])
             generated.append(next_token)
-            
+
             # Check for stop token
-            if int(next_token[0]) in stop_tokens:
+            is_stop = token_id in stop_tokens
+            is_last = is_stop or (token_idx == max_new_tokens - 1)
+
+            # Call the token callback if provided (rank 0 only sends tokens)
+            if token_callback is not None:
+                await token_callback(token_id, token_idx, is_last)
+
+            if is_stop:
                 break
-            
+
             # Forward with cache
             next_input = next_token[:, None]  # [batch, 1]
             logits = await self.forward(next_input, use_cache=True)
-        
+
         # Concatenate generated tokens
         if generated:
             generated_ids = mx.stack(generated, axis=1)
             output_ids = mx.concatenate([input_ids, generated_ids], axis=1)
         else:
             output_ids = input_ids
-        
+
         return output_ids
     
     def reset_cache(self):

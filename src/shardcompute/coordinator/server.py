@@ -13,7 +13,7 @@ from aiohttp import web
 from shardcompute.coordinator.registry import WorkerRegistry, RegistryConfig
 from shardcompute.coordinator.health import HealthMonitor, HealthConfig
 from shardcompute.coordinator.metrics import MetricsAggregator
-from shardcompute.protocol.messages import WorkerInfo, InferenceRequest, InferenceResponse
+from shardcompute.protocol.messages import WorkerInfo, InferenceRequest, InferenceResponse, StreamingToken
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +91,9 @@ class CoordinatorServer:
         self._pending_requests: asyncio.Queue = asyncio.Queue()
         self._completed_requests: Dict[str, InferenceResponse] = {}
         self._request_events: Dict[str, asyncio.Event] = {}
+
+        # Streaming token queues (one per streaming request)
+        self._streaming_queues: Dict[str, asyncio.Queue] = {}
         
         # HTTP app
         self.app = web.Application()
@@ -124,6 +127,7 @@ class CoordinatorServer:
         self.app.router.add_post("/api/inference/text/stream", self._handle_inference_text_stream)
         self.app.router.add_get("/api/inference/poll", self._handle_poll)
         self.app.router.add_post("/api/inference/response", self._handle_response)
+        self.app.router.add_post("/api/inference/stream/token", self._handle_streaming_token)
         self.app.router.add_get("/api/inference/{request_id}", self._handle_get_result)
         
         # Metrics and status
@@ -327,6 +331,8 @@ class CoordinatorServer:
 
     async def _handle_inference_text_stream(self, request: web.Request) -> web.StreamResponse:
         """Handle streaming text inference request from UI clients using SSE."""
+        import json
+
         response = web.StreamResponse(
             status=200,
             reason="OK",
@@ -338,6 +344,7 @@ class CoordinatorServer:
         )
         await response.prepare(request)
 
+        request_id = None
         try:
             data = await request.json()
             prompt = str(data.get("prompt", "")).strip()
@@ -347,54 +354,100 @@ class CoordinatorServer:
                 await response.write_eof()
                 return response
 
-            input_ids = self._encode_prompt(prompt, messages)
-            input_length = len(input_ids)
+            if not self.registry.is_cluster_ready:
+                await response.write(b"event: error\ndata: {\"error\": \"Cluster not ready\"}\n\n")
+                await response.write_eof()
+                return response
 
-            inference_response = await self._run_inference(
+            if not self.health_monitor.is_cluster_healthy():
+                await response.write(b"event: error\ndata: {\"error\": \"Cluster unhealthy\"}\n\n")
+                await response.write_eof()
+                return response
+
+            input_ids = self._encode_prompt(prompt, messages)
+
+            # Create streaming request
+            request_id = str(uuid.uuid4())
+            inference_request = InferenceRequest(
+                request_id=request_id,
                 input_ids=input_ids,
                 max_new_tokens=data.get("max_new_tokens", 120),
                 temperature=data.get("temperature", 0.7),
                 top_p=data.get("top_p", 0.9),
                 stop_tokens=data.get("stop_tokens", self._default_stop_tokens()),
-                timeout=data.get("timeout", 300),
+                stream=True,  # Enable streaming
             )
 
-            output_ids = inference_response.output_ids
-            generated_ids = output_ids[input_length:] if len(output_ids) > input_length else output_ids
-            output_text = self._decode_output(generated_ids)
+            # Create streaming queue and events for this request
+            self._streaming_queues[request_id] = asyncio.Queue()
+            self._request_events[request_id] = asyncio.Event()
 
-            # Stream tokens character by character for smooth display
-            # In the future, this can be replaced with actual token-by-token streaming from workers
-            import json
-            words = output_text.split()
-            for i, word in enumerate(words):
-                token_text = word if i == 0 else f" {word}"
-                event_data = json.dumps({"token": token_text})
-                await response.write(f"event: token\ndata: {event_data}\n\n".encode("utf-8"))
-                await asyncio.sleep(0.02)  # Small delay for visual effect
+            # Queue the request
+            await self._pending_requests.put(inference_request)
+            logger.info(f"Streaming inference request queued: {request_id}")
 
-            # Send completion event
-            completion_data = json.dumps({
-                "request_id": inference_response.request_id,
-                "timing": inference_response.timing,
-            })
-            await response.write(f"event: done\ndata: {completion_data}\n\n".encode("utf-8"))
+            timeout = data.get("timeout", 300)
+
+            # Stream tokens as they arrive
+            while True:
+                try:
+                    # Wait for next token with timeout
+                    token = await asyncio.wait_for(
+                        self._streaming_queues[request_id].get(),
+                        timeout=timeout,
+                    )
+
+                    if token.error:
+                        error_data = json.dumps({"error": token.error})
+                        await response.write(f"event: error\ndata: {error_data}\n\n".encode("utf-8"))
+                        break
+
+                    # Decode the token to text
+                    token_text = self._decode_output([token.token_id])
+                    event_data = json.dumps({"token": token_text, "token_id": token.token_id})
+                    await response.write(f"event: token\ndata: {event_data}\n\n".encode("utf-8"))
+
+                    if token.is_final:
+                        break
+
+                except asyncio.TimeoutError:
+                    error_data = json.dumps({"error": "Streaming timeout"})
+                    await response.write(f"event: error\ndata: {error_data}\n\n".encode("utf-8"))
+                    break
+
+            # Wait for final response to get timing info
+            try:
+                await asyncio.wait_for(
+                    self._request_events[request_id].wait(),
+                    timeout=5.0,  # Short timeout since tokens are done
+                )
+                final_response = self._completed_requests.pop(request_id, None)
+                if final_response:
+                    completion_data = json.dumps({
+                        "request_id": request_id,
+                        "timing": final_response.timing,
+                    })
+                    await response.write(f"event: done\ndata: {completion_data}\n\n".encode("utf-8"))
+            except asyncio.TimeoutError:
+                # Send done without timing if final response doesn't arrive
+                completion_data = json.dumps({"request_id": request_id})
+                await response.write(f"event: done\ndata: {completion_data}\n\n".encode("utf-8"))
+
             await response.write_eof()
             return response
 
-        except InferenceError as e:
-            import json
-            error_data = json.dumps({"error": str(e)})
-            await response.write(f"event: error\ndata: {error_data}\n\n".encode("utf-8"))
-            await response.write_eof()
-            return response
         except Exception as e:
             logger.error(f"Streaming text inference error: {e}")
-            import json
             error_data = json.dumps({"error": str(e)})
             await response.write(f"event: error\ndata: {error_data}\n\n".encode("utf-8"))
             await response.write_eof()
             return response
+        finally:
+            # Cleanup
+            if request_id:
+                self._streaming_queues.pop(request_id, None)
+                self._request_events.pop(request_id, None)
+                self._completed_requests.pop(request_id, None)
 
     async def _handle_poll(self, request: web.Request) -> web.Response:
         """Handle worker polling for inference requests."""
@@ -420,9 +473,9 @@ class CoordinatorServer:
         try:
             data = await request.json()
             response = InferenceResponse.from_dict(data)
-            
+
             request_id = response.request_id
-            
+
             # Record metrics
             if response.timing and not response.error:
                 self.metrics.record_inference(
@@ -431,17 +484,38 @@ class CoordinatorServer:
                     input_tokens=len(response.output_ids) // 2,  # Approximate
                     output_tokens=len(response.output_ids),
                 )
-            
+
             # Store response and signal
             self._completed_requests[request_id] = response
-            
+
             if request_id in self._request_events:
                 self._request_events[request_id].set()
-            
+
             return web.json_response({"status": "ok"})
-            
+
         except Exception as e:
             logger.error(f"Response handling error: {e}")
+            return web.json_response({"error": str(e)}, status=500)
+
+    async def _handle_streaming_token(self, request: web.Request) -> web.Response:
+        """Handle streaming token from worker."""
+        try:
+            data = await request.json()
+            token = StreamingToken.from_dict(data)
+
+            request_id = token.request_id
+
+            # Put token in the streaming queue if it exists
+            if request_id in self._streaming_queues:
+                await self._streaming_queues[request_id].put(token)
+                return web.json_response({"status": "ok"})
+            else:
+                # No streaming client waiting - this is ok, client may have disconnected
+                logger.debug(f"No streaming queue for request {request_id}")
+                return web.json_response({"status": "no_listener"})
+
+        except Exception as e:
+            logger.error(f"Streaming token handling error: {e}")
             return web.json_response({"error": str(e)}, status=500)
     
     async def _handle_get_result(self, request: web.Request) -> web.Response:

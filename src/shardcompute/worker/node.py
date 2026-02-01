@@ -19,7 +19,7 @@ from shardcompute.worker.heartbeat import HeartbeatClient, HeartbeatConfig
 from shardcompute.parallel.transformer import ParallelTransformer
 from shardcompute.model.loader import ModelLoader
 from shardcompute.model.config import ModelConfig
-from shardcompute.protocol.messages import WorkerInfo, InferenceRequest, InferenceResponse
+from shardcompute.protocol.messages import WorkerInfo, InferenceRequest, InferenceResponse, StreamingToken
 
 logger = logging.getLogger(__name__)
 
@@ -414,13 +414,13 @@ class WorkerNode:
         async with self._inference_lock:
             try:
                 self.heartbeat.set_status("processing")
-                
+
                 # Convert input to tensor
                 input_ids = mx.array([request.input_ids], dtype=mx.int32)
-                
+
                 # Broadcast parameters to followers so they know what to do
                 comm = self.peer_mesh.get_communicator()
-                
+
                 # First broadcast number of stop tokens
                 num_stop_tokens = len(request.stop_tokens) if request.stop_tokens else 0
                 params = mx.array([
@@ -431,19 +431,34 @@ class WorkerNode:
                     num_stop_tokens,
                 ], dtype=mx.int32)
                 await comm.broadcast(params, root=0)
-                
+
                 # Broadcast stop tokens if any
                 if num_stop_tokens > 0:
                     stop_tokens_array = mx.array(request.stop_tokens, dtype=mx.int32)
                     await comm.broadcast(stop_tokens_array, root=0)
-                
+
                 # Broadcast input to all workers
                 await comm.broadcast(input_ids, root=0)
-                
+
                 logger.info(f"Rank 0 starting generation: {len(request.input_ids)} input tokens, "
                            f"{request.max_new_tokens} max new tokens, "
-                           f"stop_tokens={request.stop_tokens}")
-                
+                           f"stop_tokens={request.stop_tokens}, stream={request.stream}")
+
+                # Create token callback for streaming if requested
+                token_callback = None
+                if request.stream:
+                    async def send_streaming_token(token_id: int, token_index: int, is_final: bool):
+                        """Send a streaming token to the coordinator."""
+                        streaming_token = StreamingToken(
+                            request_id=request.request_id,
+                            token_id=token_id,
+                            token_index=token_index,
+                            is_final=is_final,
+                        )
+                        await self._send_streaming_token(streaming_token)
+
+                    token_callback = send_streaming_token
+
                 # Execute inference
                 if request.max_new_tokens > 0:
                     output_ids = await self.executor.generate(
@@ -452,26 +467,37 @@ class WorkerNode:
                         temperature=request.temperature,
                         top_p=request.top_p,
                         stop_tokens=request.stop_tokens,
+                        token_callback=token_callback,
                     )
                 else:
                     # Just forward pass
                     logits = await self.executor.forward(input_ids)
                     output_ids = mx.argmax(logits, axis=-1)
-                
-                # Send response
+
+                # Send final response (for non-streaming or as completion signal)
                 response = InferenceResponse(
                     request_id=request.request_id,
                     output_ids=output_ids[0].tolist(),
                     timing=self.executor.get_timing_summary(),
                 )
-                
+
                 await self._send_response(response)
-                
+
                 self.heartbeat.set_status("ready")
-                
+
             except Exception as e:
                 error_msg = f"{type(e).__name__}: {str(e)}\n{traceback.format_exc()}"
                 logger.error(f"Inference error: {error_msg}")
+                if request.stream:
+                    # Send error as streaming token
+                    error_token = StreamingToken(
+                        request_id=request.request_id,
+                        token_id=-1,
+                        token_index=-1,
+                        is_final=True,
+                        error=error_msg,
+                    )
+                    await self._send_streaming_token(error_token)
                 response = InferenceResponse(
                     request_id=request.request_id,
                     output_ids=[],
@@ -483,10 +509,18 @@ class WorkerNode:
     async def _send_response(self, response: InferenceResponse):
         """Send inference response to coordinator."""
         url = f"{self.coordinator_url}/api/inference/response"
-        
+
         async with self._http_session.post(url, json=response.to_dict()) as resp:
             if resp.status != 200:
                 logger.error(f"Failed to send response: {await resp.text()}")
+
+    async def _send_streaming_token(self, token: StreamingToken):
+        """Send a streaming token to coordinator."""
+        url = f"{self.coordinator_url}/api/inference/stream/token"
+
+        async with self._http_session.post(url, json=token.to_dict()) as resp:
+            if resp.status != 200:
+                logger.error(f"Failed to send streaming token: {await resp.text()}")
     
     async def stop(self):
         """Stop the worker node."""
