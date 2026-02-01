@@ -1,6 +1,7 @@
 """Point-to-point communication primitives over TCP."""
 
 import asyncio
+import socket
 import struct
 import logging
 from typing import Optional, Dict, Tuple
@@ -67,7 +68,12 @@ class PeerConnection:
                 asyncio.open_connection(self.peer_info.host, self.peer_info.port),
                 timeout=self.timeout,
             )
-            
+
+            # Disable Nagle's algorithm for low-latency tensor transfers
+            sock = self.writer.get_extra_info('socket')
+            if sock is not None:
+                sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
             # Send handshake
             await self._send_handshake()
             
@@ -97,7 +103,12 @@ class PeerConnection:
         """
         self.reader = reader
         self.writer = writer
-        
+
+        # Disable Nagle's algorithm for low-latency tensor transfers
+        sock = self.writer.get_extra_info('socket')
+        if sock is not None:
+            sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
         # Receive handshake only if not already validated
         if not skip_handshake:
             await self._recv_handshake()
@@ -136,15 +147,12 @@ class PeerConnection:
         async with self._lock:
             # Serialize tensor
             data = self.serializer.serialize(tensor)
-            
-            # Send header
+
+            # Send header + data in a single write to reduce syscalls
             header = struct.pack(">II", self.MSG_TYPE_TENSOR, len(data))
-            self.writer.write(header)
-            
-            # Send data
-            self.writer.write(data)
+            self.writer.write(header + data)
             await self.writer.drain()
-            
+
             return len(data)
     
     async def recv_tensor(self) -> mx.array:
@@ -193,12 +201,11 @@ class PeerConnection:
         Returns:
             Received tensor
         """
-        send_task = asyncio.create_task(self.send_tensor(send_tensor))
-        recv_task = asyncio.create_task(self.recv_tensor())
-        
-        await send_task
-        recv_tensor = await recv_task
-        
+        _, recv_tensor = await asyncio.gather(
+            self.send_tensor(send_tensor),
+            self.recv_tensor(),
+        )
+
         return recv_tensor
     
     async def close(self):

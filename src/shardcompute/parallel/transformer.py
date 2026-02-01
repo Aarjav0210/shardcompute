@@ -459,20 +459,27 @@ class ParallelTransformer:
         
         # Process through transformer layers
         new_cache = [] if use_cache else None
-        
+
+        # Evaluate every N layers to balance memory vs GPU sync overhead.
+        # Each mx.eval() forces a GPU synchronization, so calling it every
+        # layer (32 times for Phi-2) is expensive.  Every 4 layers is a
+        # good trade-off: 8 syncs instead of 32 while keeping memory bounded.
+        eval_interval = 4
+
         for i, layer in enumerate(self.layers):
             past_kv = past_key_values[i] if past_key_values else None
-            
+
             hidden_states, layer_cache = await layer.forward(
                 hidden_states,
                 attention_mask=attention_mask,
                 past_key_value=past_kv,
                 use_cache=use_cache,
             )
-            
-            # Force evaluation to prevent memory buildup
-            mx.eval(hidden_states)
-            
+
+            # Evaluate periodically to prevent memory buildup
+            if (i + 1) % eval_interval == 0 or i == len(self.layers) - 1:
+                mx.eval(hidden_states)
+
             if use_cache and layer_cache is not None:
                 new_cache.append(layer_cache)
         
