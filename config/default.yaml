@@ -12,6 +12,7 @@ coordinator:
   tokenizer_path: "./model_cache_mlx_Llama_3b_Instruct_4bit"  # Enable /inference/text
 
 worker:
+  transport: "ws_relay"  # Options: "tcp" (direct peer-to-peer), "ws_relay" (relay via coordinator)
   collective_port_base: 9000  # Worker N uses port 9000 + N for peer connections
   collective_timeout_seconds: 30
   buffer_size: 1048576  # 1MB buffer for network operations

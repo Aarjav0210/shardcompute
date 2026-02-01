@@ -10,6 +10,7 @@ import asyncio
 import logging
 import signal
 import argparse
+import struct
 import uuid
 import time
 from typing import Dict, Any, Optional, List
@@ -118,6 +119,9 @@ class CoordinatorServer:
         # Streaming token queues (one per streaming request)
         self._streaming_queues: Dict[str, asyncio.Queue] = {}
 
+        # WebSocket relay connections for collective operations (rank -> ws)
+        self._ws_connections: Dict[int, web.WebSocketResponse] = {}
+
         # Track input lengths for metric calculation
         self._request_input_lengths: Dict[str, int] = {}
 
@@ -185,6 +189,9 @@ class CoordinatorServer:
         # Usage tracking (minimal)
         self.app.router.add_post("/usage/log", self._handle_usage_log)
         self.app.router.add_get("/usage/recent", self._handle_usage_recent)
+
+        # WebSocket relay for collective operations
+        self.app.router.add_get("/ws/collective/{rank}", self._handle_ws_collective)
 
         # Static files
         if self._static_path.exists():
@@ -820,6 +827,42 @@ class CoordinatorServer:
         limit = int(request.query.get("limit", 15))
         recent = self._usage_log[-limit:] if self._usage_log else []
         return web.json_response({"entries": recent})
+
+    async def _handle_ws_collective(self, request: web.Request) -> web.WebSocketResponse:
+        """Handle WebSocket relay for collective operations.
+
+        Each worker connects once.  Binary frames carry a 16-byte envelope
+        [sender_rank(4) | target_rank(4) | msg_type(4) | data_len(4)] followed
+        by payload.  The coordinator reads target_rank and forwards the entire
+        frame to the target worker's WebSocket — zero-copy, no deserialization.
+        """
+        rank = int(request.match_info["rank"])
+        ws = web.WebSocketResponse(max_msg_size=0)
+        await ws.prepare(request)
+
+        logger.info(f"WebSocket collective connection from rank {rank}")
+        self._ws_connections[rank] = ws
+
+        try:
+            async for msg in ws:
+                if msg.type == web.WSMsgType.BINARY:
+                    if len(msg.data) < 16:
+                        continue
+                    target_rank = struct.unpack(">I", msg.data[4:8])[0]
+                    target_ws = self._ws_connections.get(target_rank)
+                    if target_ws is not None and not target_ws.closed:
+                        await target_ws.send_bytes(msg.data)
+                    else:
+                        logger.warning(
+                            f"Cannot relay rank {rank} -> rank {target_rank}: target not connected"
+                        )
+                elif msg.type in (web.WSMsgType.CLOSE, web.WSMsgType.ERROR):
+                    break
+        finally:
+            self._ws_connections.pop(rank, None)
+            logger.info(f"WebSocket collective connection from rank {rank} closed")
+
+        return ws
 
     def _load_tokenizer(self):
         """Load tokenizer if configured."""

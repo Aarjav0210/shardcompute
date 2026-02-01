@@ -196,25 +196,39 @@ class WorkerNode:
     
     async def _setup_peer_mesh(self, peers: List[WorkerInfo]):
         """Setup peer mesh and establish connections."""
+        worker_config = self.config.get("worker", {})
+        transport = worker_config.get("transport", "ws_relay")
+
+        coordinator_ws_url = None
+        if transport == "ws_relay":
+            coordinator_ws_url = (
+                self.coordinator_url
+                .replace("http://", "ws://")
+                .replace("https://", "wss://")
+                + "/ws/collective"
+            )
+
         config = MeshConfig(
             world_size=self._world_size,
-            connection_timeout=self.config.get("worker", {}).get("collective_timeout_seconds", 30),
+            connection_timeout=worker_config.get("collective_timeout_seconds", 30),
+            transport=transport,
+            coordinator_ws_url=coordinator_ws_url,
         )
-        
+
         self.peer_mesh = PeerMesh(
             rank=self.rank,
             host=self.host,
             port=self.collective_port,
             config=config,
         )
-        
+
         self.peer_mesh.set_peers(peers)
-        
+
         success = await self.peer_mesh.connect()
         if not success:
             raise RuntimeError("Failed to connect peer mesh")
-        
-        logger.info(f"Rank {self.rank} peer mesh connected")
+
+        logger.info(f"Rank {self.rank} peer mesh connected via {transport}")
     
     async def _load_model(self):
         """Load model with weight shards."""

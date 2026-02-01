@@ -15,11 +15,13 @@ logger = logging.getLogger(__name__)
 @dataclass
 class MeshConfig:
     """Configuration for the peer mesh."""
-    
+
     world_size: int
     connection_timeout: float = 30.0
     retry_attempts: int = 3
     retry_delay: float = 2.0
+    transport: str = "ws_relay"  # "tcp" or "ws_relay"
+    coordinator_ws_url: Optional[str] = None  # Required when transport="ws_relay"
 
 
 class PeerMesh:
@@ -99,57 +101,100 @@ class PeerMesh:
     async def connect(self) -> bool:
         """
         Establish connections to all peers.
-        
+
         Returns:
             True if all connections successful
         """
         if self._connected:
             logger.warning("Mesh already connected")
             return True
-        
-        logger.info(f"Rank {self.rank} connecting to peer mesh")
 
-        # Build peer info list for communicator
+        if self.config.transport == "ws_relay":
+            return await self._connect_ws_relay()
+        return await self._connect_tcp()
+
+    async def _connect_tcp(self) -> bool:
+        """Connect using direct TCP peer-to-peer connections."""
+        logger.info(f"Rank {self.rank} connecting to peer mesh (TCP)")
+
         peer_info_list = [None] * self.config.world_size
         peer_info_list[self.rank] = PeerInfo(
             rank=self.rank,
             host=self.host,
             port=self.port,
         )
-
         for peer_rank, peer_info in self.peers.items():
             peer_info_list[peer_rank] = peer_info
 
-        # Attempt connection with retries
         for attempt in range(self.config.retry_attempts):
-            # Create a fresh communicator for each attempt
             self.communicator = Communicator(
                 rank=self.rank,
                 world_size=self.config.world_size,
                 host=self.host,
                 port=self.port,
             )
-
             try:
                 await self.communicator.initialize(
                     peer_info_list,
                     timeout=self.config.connection_timeout,
                 )
                 self._connected = True
-                logger.info(f"Rank {self.rank} mesh connected successfully")
+                logger.info(f"Rank {self.rank} mesh connected successfully (TCP)")
                 return True
-
             except Exception as e:
                 logger.warning(
                     f"Rank {self.rank} connection attempt {attempt + 1} failed: {e}"
                 )
-                # Clean up the failed communicator to release the bound port
                 await self.communicator.shutdown()
                 self.communicator = None
                 if attempt < self.config.retry_attempts - 1:
                     await asyncio.sleep(self.config.retry_delay)
-        
-        logger.error(f"Rank {self.rank} failed to connect to mesh")
+
+        logger.error(f"Rank {self.rank} failed to connect to mesh (TCP)")
+        return False
+
+    async def _connect_ws_relay(self) -> bool:
+        """Connect via WebSocket relay through coordinator."""
+        if not self.config.coordinator_ws_url:
+            raise ValueError("coordinator_ws_url required for ws_relay transport")
+
+        logger.info(f"Rank {self.rank} connecting to peer mesh (WS relay)")
+
+        peer_info_list = [None] * self.config.world_size
+        peer_info_list[self.rank] = PeerInfo(
+            rank=self.rank,
+            host=self.host,
+            port=self.port,
+        )
+        for peer_rank, peer_info in self.peers.items():
+            peer_info_list[peer_rank] = peer_info
+
+        for attempt in range(self.config.retry_attempts):
+            self.communicator = Communicator(
+                rank=self.rank,
+                world_size=self.config.world_size,
+                host=self.host,
+                port=self.port,
+            )
+            try:
+                await self.communicator.initialize_ws_relay(
+                    coordinator_ws_url=self.config.coordinator_ws_url,
+                    peer_infos=peer_info_list,
+                    timeout=self.config.connection_timeout,
+                )
+                self._connected = True
+                logger.info(f"Rank {self.rank} mesh connected successfully (WS relay)")
+                return True
+            except Exception as e:
+                logger.warning(
+                    f"Rank {self.rank} WS relay attempt {attempt + 1} failed: {e}"
+                )
+                await self.communicator.shutdown()
+                self.communicator = None
+                if attempt < self.config.retry_attempts - 1:
+                    await asyncio.sleep(self.config.retry_delay)
+
+        logger.error(f"Rank {self.rank} failed to connect to mesh (WS relay)")
         return False
     
     async def barrier(self):

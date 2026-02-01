@@ -178,6 +178,57 @@ class Communicator:
         self._initialized = True
         logger.info(f"Rank {self.rank} communicator initialized successfully")
     
+    async def initialize_ws_relay(
+        self,
+        coordinator_ws_url: str,
+        peer_infos: List[PeerInfo],
+        timeout: float = 30.0,
+    ):
+        """
+        Initialize connections via WebSocket relay through coordinator.
+
+        Instead of direct TCP, each peer connection is a
+        WebSocketRelayConnection that routes traffic through the
+        coordinator's /ws/collective/{rank} endpoint.
+        """
+        if self._initialized:
+            logger.warning("Communicator already initialized")
+            return
+
+        logger.info(f"Rank {self.rank} initializing communicator via WS relay")
+
+        from shardcompute.collectives.ws_relay import WebSocketRelayManager
+
+        self._relay_manager = WebSocketRelayManager(
+            rank=self.rank,
+            coordinator_ws_url=coordinator_ws_url,
+            world_size=self.world_size,
+            timeout=timeout,
+        )
+        await self._relay_manager.connect()
+
+        # Create relay connections for each peer
+        for other_rank in range(self.world_size):
+            if other_rank == self.rank:
+                continue
+            self.peers[other_rank] = self._relay_manager.get_connection(other_rank)
+
+        # Create topology
+        self.topology = create_topology(
+            self.topology_type,
+            self.rank,
+            self.world_size,
+            peer_infos,
+        )
+
+        # Initialize collective operations (same as TCP path)
+        self._all_reduce = RingAllReduce(self.rank, self.world_size, self.peers, self.topology)
+        self._all_gather = AllGather(self.rank, self.world_size, self.peers, self.topology)
+        self._reduce_scatter = ReduceScatter(self.rank, self.world_size, self.peers)
+
+        self._initialized = True
+        logger.info(f"Rank {self.rank} communicator initialized via WS relay")
+
     async def _connect_to_peer(
         self,
         connection: PeerConnection,
@@ -387,16 +438,21 @@ class Communicator:
     async def shutdown(self):
         """Shutdown communicator and close all connections."""
         logger.info(f"Rank {self.rank} shutting down communicator")
-        
+
         # Close peer connections
         for peer in self.peers.values():
             await peer.close()
         self.peers.clear()
-        
-        # Stop server
+
+        # Stop TCP server if used
         if self._server:
             await self._server.stop()
-        
+
+        # Close WS relay manager if used
+        if hasattr(self, '_relay_manager') and self._relay_manager:
+            await self._relay_manager.close()
+            self._relay_manager = None
+
         self._initialized = False
         logger.info(f"Rank {self.rank} communicator shutdown complete")
 
