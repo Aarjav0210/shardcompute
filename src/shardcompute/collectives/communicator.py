@@ -427,6 +427,19 @@ class Communicator:
         
         return await self.peers[source].recv_tensor()
     
+    def flush_peers(self):
+        """Flush all peer recv queues to discard stale data.
+
+        Call at the start of each inference cycle to prevent
+        desynchronization after a failed operation.
+        """
+        total = 0
+        for peer in self.peers.values():
+            if hasattr(peer, 'flush'):
+                total += peer.flush()
+        if total > 0:
+            logger.info(f"Rank {self.rank} flushed {total} stale messages from peers")
+
     def get_stats(self) -> Dict[str, Any]:
         """Get communication statistics."""
         return self.stats.to_dict()

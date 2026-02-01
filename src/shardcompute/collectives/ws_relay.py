@@ -88,6 +88,22 @@ class WebSocketRelayConnection:
         recv_tensor = await recv_task
         return recv_tensor
 
+    def flush(self):
+        """Drain all pending data from recv queue to discard stale messages."""
+        discarded = 0
+        while not self._recv_queue.empty():
+            try:
+                self._recv_queue.get_nowait()
+                discarded += 1
+            except asyncio.QueueEmpty:
+                break
+        if discarded > 0:
+            logger.debug(
+                f"Rank {self.local_rank} flushed {discarded} stale messages "
+                f"from peer {self.peer_rank}"
+            )
+        return discarded
+
     async def close(self):
         self._connected = False
 

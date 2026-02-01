@@ -384,9 +384,12 @@ class WorkerNode:
         
         while self._running:
             try:
+                # Flush stale data from previous failed inference cycles
+                comm = self.peer_mesh.get_communicator()
+                comm.flush_peers()
+
                 # Wait for generation parameters broadcast from rank 0
                 # Format: [input_ids_len, max_new_tokens, temperature (scaled), top_p (scaled), num_stop_tokens]
-                comm = self.peer_mesh.get_communicator()
                 params = await comm.broadcast(None, root=0)
                 
                 if params.size == 0:
@@ -442,8 +445,9 @@ class WorkerNode:
                 # Convert input to tensor
                 input_ids = mx.array([request.input_ids], dtype=mx.int32)
 
-                # Broadcast parameters to followers so they know what to do
+                # Flush stale data from previous failed inference cycles
                 comm = self.peer_mesh.get_communicator()
+                comm.flush_peers()
 
                 # First broadcast number of stop tokens
                 num_stop_tokens = len(request.stop_tokens) if request.stop_tokens else 0
