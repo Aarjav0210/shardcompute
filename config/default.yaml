@@ -18,7 +18,11 @@ worker:
   buffer_size: 1048576  # 1MB buffer for network operations
 
 parallelism:
+  mode: "pipeline"
+  # mode: "tensor"  # Options: "tensor" (TP - all workers have all layers with partial weights),
+                   #          "pipeline" (PP - each worker has full weights for a subset of layers)
   tensor_parallel_size: 2  # Number of workers for tensor parallelism
+  pipeline_parallel_size: 2  # Number of workers for pipeline parallelism
   topology: "ring"  # Options: ring, tree, direct (for 2 workers)
 
 model:
