@@ -556,15 +556,10 @@ class PipelineWeightSharder:
                         base_name = name.rsplit(".weight", 1)[0]
                         scales_key = f"{base_name}.scales"
                         biases_key = f"{base_name}.biases"
-                        # Transpose quantized lm_head components
-                        if len(weight.shape) == 2:
-                            sharded[name] = weight.T.copy()
-                            sharded[scales_key] = weights[scales_key].T.copy()
-                            sharded[biases_key] = weights[biases_key].T.copy()
-                        else:
-                            sharded[name] = weight.copy()
-                            sharded[scales_key] = weights[scales_key].copy()
-                            sharded[biases_key] = weights[biases_key].copy()
+                        # Copy quantized lm_head as-is (MLX models already in correct format)
+                        sharded[name] = weight.copy()
+                        sharded[scales_key] = weights[scales_key].copy()
+                        sharded[biases_key] = weights[biases_key].copy()
                         processed.add(scales_key)
                         processed.add(biases_key)
                     else:
@@ -585,17 +580,12 @@ class PipelineWeightSharder:
                         scales_key = f"{base_name}.scales"
                         biases_key = f"{base_name}.biases"
 
-                        # Transpose quantized linear weights to MLX format
-                        if self._is_linear_weight(name) and len(weight.shape) == 2:
-                            sharded[name] = weight.T.copy()
-                            # Transpose scales and biases as well
-                            sharded[scales_key] = weights[scales_key].T.copy()
-                            sharded[biases_key] = weights[biases_key].T.copy()
-                        else:
-                            # Non-linear or 1D weights (layer norms, biases)
-                            sharded[name] = weight.copy()
-                            sharded[scales_key] = weights[scales_key].copy()
-                            sharded[biases_key] = weights[biases_key].copy()
+                        # For quantized weights: copy as-is (no transpose)
+                        # MLX-format models (mlx-community/*) are already in correct format
+                        # Weights are already [out_features, in_features//2] for quantized
+                        sharded[name] = weight.copy()
+                        sharded[scales_key] = weights[scales_key].copy()
+                        sharded[biases_key] = weights[biases_key].copy()
                         processed.add(scales_key)
                         processed.add(biases_key)
                     else:

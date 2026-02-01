@@ -633,15 +633,18 @@ class LinearLayer:
             raise RuntimeError("Weight not loaded")
 
         if self.is_quantized:
-            # Quantized linear: dequantize then matmul
-            weight_full = mx.dequantize(
+            # Quantized linear: use quantized_matmul with transpose=True
+            # This matches the working QuantizedColumnParallelLinear implementation
+            # transpose=True handles the weight format correctly for MLX quantized weights
+            output = mx.quantized_matmul(
+                x,
                 self.weight,
                 self.scales,
                 self.biases_quant,
+                transpose=True,
                 group_size=self.group_size,
                 bits=self.bits,
             )
-            output = x @ weight_full
         else:
             output = x @ self.weight
 

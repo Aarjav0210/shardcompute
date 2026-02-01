@@ -1,7 +1,8 @@
 # Pipeline Parallelism Implementation - Plan of Action
 
 **Date:** 2026-02-01
-**Status:** In Progress - Fix Applied, Testing Required
+**Status:** Fixed - Ready for Testing
+**Last Updated:** 2026-02-01 19:30
 
 ---
 
@@ -27,33 +28,64 @@ A previous implementation added Pipeline Parallelism (PP) as an alternative to T
 
 ---
 
-## Issues Identified
+## Issues Identified and Fixed
 
-### Issue #1: Quantized Weight Transpose Missing ⚠️ **[FIXED]**
+### Issue #1: Wrong Quantization API ✅ **[FIXED]**
 
 **Problem:**
-- `PipelineWeightSharder` transposes standard 2D linear weights from HuggingFace `[out, in]` to MLX `[in, out]` format
-- BUT quantized weights (with separate `.scales` and `.biases`) were NOT being transposed
-- MLX's `mx.dequantize()` expects `[out, in]` format with matching scales/biases dimensions
+- `LinearLayer.__call__()` used `mx.dequantize()` + regular matmul
+- Existing working code uses `mx.quantized_matmul()` with `transpose=True`
+- These have different shape expectations and behavior
 
-**Result:**
+**Error:**
 ```
 ValueError: [dequantize] Shape of scales and biases does not match the matrix
 ```
-at `transformer.py:637` in `LinearLayer.__call__()`
+
+**Root Cause:**
+The new `LinearLayer` class didn't follow the same pattern as the working `QuantizedColumnParallelLinear`:
+- ❌ Wrong: `mx.dequantize(weight, scales, biases)` then `x @ weight_full`
+- ✅ Correct: `mx.quantized_matmul(x, weight, scales, biases, transpose=True)`
 
 **Fix Applied:**
-- Modified `PipelineWeightSharder.shard_weights()` in `src/shardcompute/model/sharder.py`
-- Added quantized weight detection and group processing
-- Now transposes all three components (weight, scales, biases) together for quantized linear layers
-- Commit: *[To be created after testing]*
-
-**Files Modified:**
-- `src/shardcompute/model/sharder.py`
+Changed [transformer.py:631-650](src/shardcompute/parallel/transformer.py#L631-L650) to use `mx.quantized_matmul()` with `transpose=True` parameter, matching the working tensor parallelism implementation.
 
 ---
 
-### Issue #2: No Pipeline Shards Exist ⚠️ **[PENDING]**
+### Issue #2: MLX Format vs HuggingFace Format ✅ **[FIXED]**
+
+**Problem:**
+- Initial fix attempted to transpose quantized weights assuming HuggingFace format source
+- BUT `mlx-community/Llama-3.2-3B-Instruct-4bit` model is **already in MLX format**
+- Transposing MLX-format weights made them incorrect!
+
+**Discovery:**
+```python
+# Original MLX model (already correct):
+weight: (3072, 384)  # [out_features, in_features // 8]
+scales: (3072, 48)   # [out_features, in_features // group_size]
+biases: (3072, 48)   # [out_features, in_features // group_size]
+
+# After incorrect transpose (broken):
+weight: [384, 3072]  # ← Wrong direction!
+scales: [48, 3072]   # ← Wrong direction!
+biases: [48, 3072]   # ← Wrong direction!
+```
+
+**Fix Applied:**
+- Modified `PipelineWeightSharder.shard_weights()` to **NOT transpose** quantized weights
+- MLX-format models are already in the correct format
+- Standard (non-quantized) weights still get transposed as needed
+- [sharder.py:588-596](src/shardcompute/model/sharder.py#L588-L596)
+
+**Files Modified:**
+- `src/shardcompute/model/sharder.py` (lines 530-599)
+
+---
+
+---
+
+### Issue #3: No Pipeline Shards Exist ✅ **[COMPLETED]**
 
 **Problem:**
 - All existing shard directories use tensor parallelism format:
@@ -66,13 +98,15 @@ at `transformer.py:637` in `LinearLayer.__call__()`
 - Cannot test pipeline parallelism without regenerating shards
 - Runtime failures due to weight dimension mismatches
 
-**Resolution Required:**
-- Regenerate shards using the fixed `PipelineWeightSharder`
-- Update configuration to point to new shard directories
+**Resolution:**
+- ✅ Pipeline shards regenerated with fixed code
+- ✅ Located at `./model_shards_mlx_Llama_3b_Instruct_4bit_pipeline/`
+- ✅ Config shows `"mode": "pipeline"` correctly
+- ✅ Weights in correct MLX format (no unwanted transpose)
 
 ---
 
-### Issue #3: Incomplete End-to-End Testing ⚠️ **[PENDING]**
+### Issue #4: Incomplete End-to-End Testing ⚠️ **[PENDING]**
 
 **Problem:**
 - Implementation appears untested with:
@@ -89,96 +123,102 @@ at `transformer.py:637` in `LinearLayer.__call__()`
 
 ## Action Plan
 
-### ✅ Step 1: Fix Quantized Weight Transpose (COMPLETED)
+### ✅ Step 1: Fix Wrong Quantization API (COMPLETED)
 
 **What was done:**
-- Added `_is_quantized_weight()` helper to detect quantization components
-- Added `_is_linear_weight()` helper to identify layers needing transpose
-- Modified `shard_weights()` to:
-  - Track processed quantization components
-  - Transpose weight, scales, and biases together for linear layers
-  - Preserve embedding format (no transpose)
-  - Handle quantized lm_head properly
+- Changed `LinearLayer.__call__()` to use `mx.quantized_matmul()` instead of `mx.dequantize()`
+- Added `transpose=True` parameter to match working `QuantizedColumnParallelLinear`
+- This matches exactly how tensor parallelism handles quantized weights
 
 **Code changes:**
 ```python
-# Before (INCORRECT):
-if len(weight.shape) == 2 and not any(x in name for x in ["layernorm", ...]):
-    sharded[name] = weight.T.copy()
-# Scales and biases were processed separately without transpose awareness
+# Before (WRONG - caused shape mismatch):
+if self.is_quantized:
+    weight_full = mx.dequantize(
+        self.weight, self.scales, self.biases_quant,
+        group_size=self.group_size, bits=self.bits,
+    )
+    output = x @ weight_full
 
-# After (CORRECT):
-if self._is_quantized_weight(name, weights):
-    if self._is_linear_weight(name) and len(weight.shape) == 2:
-        sharded[name] = weight.T.copy()
-        sharded[scales_key] = weights[scales_key].T.copy()  # ← Fixed
-        sharded[biases_key] = weights[biases_key].T.copy()  # ← Fixed
+# After (CORRECT - matches working TP code):
+if self.is_quantized:
+    output = mx.quantized_matmul(
+        x, self.weight, self.scales, self.biases_quant,
+        transpose=True,  # ← Key parameter
+        group_size=self.group_size, bits=self.bits,
+    )
 ```
+
+**File:** `src/shardcompute/parallel/transformer.py:631-650`
 
 ---
 
-### 🔲 Step 2: Regenerate Pipeline Shards
+### ✅ Step 2: Fix MLX Format Handling (COMPLETED)
+
+**What was done:**
+- Removed incorrect transpose for quantized weights in `PipelineWeightSharder`
+- MLX-format models (`mlx-community/*`) are already in correct format
+- Only non-quantized standard weights get transposed
+
+**Code changes:**
+```python
+# For quantized weights: copy as-is (no transpose)
+# MLX-format models are already [out_features, in_features//2]
+sharded[name] = weight.copy()
+sharded[scales_key] = weights[scales_key].copy()
+sharded[biases_key] = weights[biases_key].copy()
+```
+
+**File:** `src/shardcompute/model/sharder.py:588-596`
+
+---
+
+### ✅ Step 3: Regenerate Pipeline Shards (COMPLETED)
 
 **Objective:** Create properly formatted pipeline-parallel weight shards
 
-**Commands:**
-
-#### For Phi-2 (2.7B, non-quantized):
+**Command Used:**
 ```bash
 python scripts/shard_weights.py \
-    --model-dir ./model_cache_phi2 \
-    --output-dir ./model_shards_phi2_pipeline \
+    --model ./model_cache_mlx_Llama_3b_Instruct_4bit \
+    --output ./model_shards_mlx_Llama_3b_Instruct_4bit_pipeline \
     --world-size 2 \
     --mode pipeline
 ```
 
-#### For Llama 3.2 3B (quantized 4-bit):
-```bash
-python scripts/shard_weights.py \
-    --model-dir ./model_cache_mlx_Llama_3b_Instruct_4bit \
-    --output-dir ./model_shards_llama3_3b_pipeline \
-    --world-size 2 \
-    --mode pipeline
-```
-
-**Expected output:**
-- `model_shards_*_pipeline/config.json` with `"mode": "pipeline"`
-- `model_shards_*_pipeline/rank_0/` with embedding + first N/2 layers
-- `model_shards_*_pipeline/rank_1/` with last N/2 layers + norm + lm_head
-- All linear weights transposed to MLX format
-- Quantized components (if present) transposed together
-
-**Validation:**
-- Check `config.json` has correct parallelism mode
-- Verify `metadata.json` shows expected layer distribution
-- Confirm tensor shapes match expected dimensions
+**Validation Results:**
+- ✅ `config.json` has `"mode": "pipeline"`
+- ✅ `rank_0/` and `rank_1/` directories created
+- ✅ Quantized weights have correct shapes (not transposed from MLX format):
+  - `weight: [3072, 384]` - MLX format preserved
+  - `scales: [3072, 48]` - MLX format preserved
+  - `biases: [3072, 48]` - MLX format preserved
 
 ---
 
-### 🔲 Step 3: Update Configuration
+### ✅ Step 4: Update Configuration (COMPLETED)
 
 **File:** `config/default.yaml`
 
-**Changes needed:**
+**Changes made:**
 ```yaml
 parallelism:
-  mode: "pipeline"  # Already set
-  pipeline_parallel_size: 2
+  mode: "pipeline"  # ✅ Set
+  pipeline_parallel_size: 2  # ✅ Set
 
 model:
-  # Update to use pipeline shards:
-  shards_dir: "./model_shards_phi2_pipeline"
-  # OR for quantized:
-  # shards_dir: "./model_shards_llama3_3b_pipeline"
+  name: "mlx-community/Llama-3.2-3B-Instruct-4bit"  # ✅ MLX model
+  # ... all model params configured
+
+inference:
+  eos_token_id: 128009  # ✅ Set for Llama 3.2
 ```
 
-**Verification:**
-- Ensure `mode` matches shard directory format
-- Confirm `shards_dir` points to regenerated pipeline shards
+**Note:** Workers are started with `--shard-dir` command line arg, not from config
 
 ---
 
-### 🔲 Step 4: Test Inference
+### 🔲 Step 5: Test Inference (READY TO TEST)
 
 **Objective:** Validate end-to-end pipeline parallelism with quantized weights
 
@@ -187,16 +227,24 @@ model:
 python -m shardcompute.coordinator.server
 ```
 
-#### 4.2 Start Workers (2 terminals)
+#### 5.2 Start Workers (2 terminals)
 ```bash
 # Terminal 1 - Worker 0
-python -m shardcompute.worker.node --rank 0
+python scripts/start_worker.py \
+    --rank 0 \
+    --coordinator-url http://localhost:8000 \
+    --shard-dir ./model_shards_mlx_Llama_3b_Instruct_4bit_pipeline \
+    --config config/default.yaml
 
 # Terminal 2 - Worker 1
-python -m shardcompute.worker.node --rank 1
+python scripts/start_worker.py \
+    --rank 1 \
+    --coordinator-url http://localhost:8000 \
+    --shard-dir ./model_shards_mlx_Llama_3b_Instruct_4bit_pipeline \
+    --config config/default.yaml
 ```
 
-#### 4.3 Send Test Request
+#### 5.3 Send Test Request
 ```bash
 curl -X POST http://localhost:8000/inference/text \
   -H "Content-Type: application/json" \
@@ -219,7 +267,7 @@ curl -X POST http://localhost:8000/inference/text \
 
 ---
 
-### 🔲 Step 5: Performance Validation (Optional)
+### 🔲 Step 6: Performance Validation (Optional)
 
 **Objective:** Confirm pipeline parallelism reduces communication overhead vs tensor parallelism
 
@@ -259,14 +307,23 @@ curl -X POST http://localhost:8000/inference/text \
 
 ---
 
-## Implementation Details
+## Summary of Fixes
 
-### Key Files Modified
+### Root Causes Identified
 
-1. **`src/shardcompute/model/sharder.py`**
-   - `PipelineWeightSharder._is_quantized_weight()` - NEW
-   - `PipelineWeightSharder._is_linear_weight()` - NEW
-   - `PipelineWeightSharder.shard_weights()` - MODIFIED
+1. **Wrong API Usage**: Used `mx.dequantize()` instead of `mx.quantized_matmul(transpose=True)`
+2. **Format Confusion**: Tried to transpose MLX-format weights that were already correct
+3. **Code Duplication**: New `LinearLayer` reimplemented logic instead of reusing existing patterns
+
+### Files Modified
+
+1. **`src/shardcompute/parallel/transformer.py`**
+   - `LinearLayer.__call__()` - Changed to use `mx.quantized_matmul()` (lines 631-650)
+
+2. **`src/shardcompute/model/sharder.py`**
+   - `PipelineWeightSharder._is_quantized_weight()` - NEW (helper)
+   - `PipelineWeightSharder._is_linear_weight()` - NEW (helper)
+   - `PipelineWeightSharder.shard_weights()` - MODIFIED (no transpose for quantized)
 
 ### Key Files (Not Modified, Already Correct)
 
@@ -348,5 +405,18 @@ the matrix error in pipeline parallelism mode with quantized models."
 
 ---
 
-**Last Updated:** 2026-02-01
-**Next Review:** After Step 4 (Test Inference) completion
+**Status Summary:**
+- ✅ Issue #1: Wrong quantization API - FIXED
+- ✅ Issue #2: MLX format confusion - FIXED
+- ✅ Issue #3: Pipeline shards generated - COMPLETE
+- ✅ Issue #4: Configuration updated - COMPLETE
+- 🔲 Issue #5: End-to-end testing - READY
+
+**Next Steps:**
+1. Start coordinator and workers with pipeline shards
+2. Send test inference request
+3. Verify successful generation with no errors
+4. Optional: Performance comparison vs tensor parallelism
+
+**Last Updated:** 2026-02-01 19:30
+**Next Review:** After successful inference test
